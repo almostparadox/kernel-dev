@@ -1,4 +1,4 @@
-# Linux Kernel Learning Lab
+# Kernel Development Lab
 
 Windows cannot build Linux kernel modules directly. Use WSL2 Ubuntu already installed on system.
 
@@ -7,7 +7,7 @@ Windows cannot build Linux kernel modules directly. Use WSL2 Ubuntu already inst
 Open terminal and run:
 ```bash
 wsl -d Ubuntu
-cd /mnt/d/Active-Projects/learn-kernel-dev
+cd /mnt/d/Active-Projects/kernel-dev
 ```
 
 ## 2. Install Build Dependencies (WSL2)
