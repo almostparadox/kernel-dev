@@ -32,11 +32,19 @@ Detailed profiling and model-level impact: see [BENCHMARK_STATS.md](BENCHMARK_ST
 
 ## Build and Run
 
-Run via Windows `cmd.exe`:
+From repository root:
 ```cmd
-nvcc_run.bat -arch=native 03-cuda-llm-kernels\rmsnorm_bench.cu -o 03-cuda-llm-kernels\rmsnorm_bench.exe
+:: 1. Compile and run microbenchmarks
+scripts\nvcc_run.bat -arch=native 03-cuda-llm-kernels\rmsnorm_bench.cu -o 03-cuda-llm-kernels\rmsnorm_bench.exe
 03-cuda-llm-kernels\rmsnorm_bench.exe
 
-nvcc_run.bat -arch=native 03-cuda-llm-kernels\swiglu_bench.cu -o 03-cuda-llm-kernels\swiglu_bench.exe
+scripts\nvcc_run.bat -arch=native 03-cuda-llm-kernels\swiglu_bench.cu -o 03-cuda-llm-kernels\swiglu_bench.exe
 03-cuda-llm-kernels\swiglu_bench.exe
+
+:: 2. Compile custom ops shared library for PyTorch integration
+scripts\nvcc_run.bat --shared 03-cuda-llm-kernels\custom_ops.cu -o 03-cuda-llm-kernels\custom_ops.dll
+
+:: 3. Run side-by-side LLM inference benchmarks
+scripts\run_side_by_side_7b.bat "Explain quantum computing in one short sentence."
+scripts\run_side_by_side_3b.bat "Explain quantum computing in one short sentence."
 ```

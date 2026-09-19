@@ -9,9 +9,16 @@
 *.symvers
 .tmp_versions/
 *.d
+*.dll
+*.lib
+*.exp
+*.so
 
 # Temporary logs & artifacts
 *.log
 *.tmp
+*.txt
 .DS_Store
 Thumbs.db
+__pycache__/
+*.pyc
