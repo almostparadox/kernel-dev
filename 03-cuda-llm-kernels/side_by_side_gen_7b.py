@@ -144,7 +144,7 @@ def main():
     # RUN A: WITHOUT Custom CUDA (Native PyTorch Default)
     # -------------------------------------------------------------------------
     print("\n[3/4] Running Generation WITHOUT Custom CUDA (Native PyTorch)...")
-    res_native = generate_with_timing(model, tokenizer, prompt, max_new_tokens=60)
+    res_native = generate_with_timing(model, tokenizer, prompt, max_new_tokens=120)
 
     # -------------------------------------------------------------------------
     # PATCH MODEL WITH CUSTOM CUDA KERNELS
@@ -176,7 +176,7 @@ def main():
     # RUN B: WITH Custom CUDA Kernels
     # -------------------------------------------------------------------------
     print("\n[4/4] Running Generation WITH Custom CUDA Kernels...")
-    res_custom = generate_with_timing(model, tokenizer, prompt, max_new_tokens=60)
+    res_custom = generate_with_timing(model, tokenizer, prompt, max_new_tokens=120)
 
     # -------------------------------------------------------------------------
     # Comparison & Validation
