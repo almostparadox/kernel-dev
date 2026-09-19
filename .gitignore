@@ -1,0 +1,17 @@
+# Binaries and object files
+*.exe
+*.o
+*.obj
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+.tmp_versions/
+*.d
+
+# Temporary logs & artifacts
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
