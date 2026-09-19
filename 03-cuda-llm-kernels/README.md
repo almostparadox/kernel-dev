@@ -26,6 +26,10 @@ Formula: $\text{SwiGLU}(x, W_{gate}, W_{up}) = \text{SiLU}(x W_{gate}) \odot (x 
 - **Approach 2 (Fused)**: Single kernel launch. Keeps activation in registers.
 - **Approach 3 (Fused + Vectorized float4)**: Single kernel with 128-bit coalesced memory loads.
 
+## Benchmark Results
+
+Detailed profiling and model-level impact: see [BENCHMARK_STATS.md](BENCHMARK_STATS.md).
+
 ## Build and Run
 
 Run via Windows `cmd.exe`:
