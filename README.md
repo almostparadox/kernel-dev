@@ -110,3 +110,27 @@ sudo apt install -y build-essential linux-headers-generic kmod
   ```bash
   cd 02-char-device && make && ./test
   ```
+
+---
+
+## Part 3: PagedAttention & FlashDecoding (Production Inference Engine)
+
+Hardware-level implementation of virtual memory paging for LLM Key-Value caches and multi-split parallel decode attention [1], [4].
+
+### Key Architectural Optimizations
+- **Virtual Page Allocation ($B=16$)**: Emulates OS page tables with fixed-size physical blocks, eliminating 60–80% HBM fragmentation during autoregressive decoding [1].
+- **Online Softmax Accumulation**: Single-pass fused dot-product attention maintaining running numerical max $m$ and sum-of-exponentials $l$ in SRAM [2], [5].
+- **FlashDecoding Split-KV**: Sequence-axis partitioning across independent CUDA thread blocks for long contexts ($L \ge 2048$), followed by a log-sum-exp reduction kernel [4].
+- **Mathematical Specification**: Formal LaTeX derivations and algorithmic proofs available in [`docs/math/paged_attention_math.tex`](docs/math/paged_attention_math.tex) (compiled for TeXShop with IEEE bibliography).
+
+---
+
+## Authoritative Literature & References (IEEE Style)
+
+- **[1]** W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, and I. Stoica, "Efficient memory management for large language model serving with PagedAttention," in *Proc. 29th ACM Symp. Operating Syst. Princ. (SOSP '23)*, 2023, pp. 611–626. doi: [10.1145/3600006.3613165](https://doi.org/10.1145/3600006.3613165).
+- **[2]** T. Dao, D. Y. Fu, S. Ermon, A. Rudra, and C. Ré, "FlashAttention: Fast and memory-efficient exact attention with IO-awareness," in *Adv. Neural Inf. Process. Syst. (NeurIPS 2022)*, vol. 35, 2022, pp. 16344–16359.
+- **[3]** T. Dao, "FlashAttention-2: Faster attention with better parallelism and work partitioning," in *Int. Conf. Learn. Represent. (ICLR 2024)*, 2024. arXiv: [2307.08691](https://arxiv.org/abs/2307.08691).
+- **[4]** T. Dao, D. Haziza, F. Massa, and G. Sizov, "Flash-Decoding for long-context inference," *Stanford CRFM*, 2023. [Online]. Available: https://crfm.stanford.edu/2023/10/12/flashdecoding.html.
+- **[5]** M. Milakov and N. Gimelshein, "Online normalizer calculation for softmax," *arXiv preprint arXiv:1805.02867*, 2018. doi: [10.48550/arXiv.1805.02867](https://doi.org/10.48550/arXiv.1805.02867).
+- **[6]** NVIDIA Corporation, *CUDA C++ Programming Guide (Release 12.x)*, Santa Clara, CA, USA, 2024. [Online]. Available: https://docs.nvidia.com/cuda/cuda-c-programming-guide/.
+- **[7]** NVIDIA Corporation, *NVIDIA A100 Tensor Core GPU Architecture*, Whitepaper WP-10019-001_v01, Santa Clara, CA, USA, 2020. [Online]. Available: https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf.

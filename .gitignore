@@ -22,3 +22,8 @@
 Thumbs.db
 __pycache__/
 *.pyc
+*.aux
+*.out
+*.synctex.gz
+*.bbl
+*.blg
