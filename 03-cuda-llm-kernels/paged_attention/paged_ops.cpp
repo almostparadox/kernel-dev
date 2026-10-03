@@ -281,6 +281,7 @@ torch::Tensor paged_attention_splitkv(
     c10::optional<torch::Tensor> out_opt = c10::nullopt
 ) {
     TORCH_CHECK(num_splits >= 1, "num_splits must be at least 1, got ", num_splits);
+    TORCH_CHECK(num_splits <= 128, "num_splits must be <= 128, got ", num_splits);
     check_paged_attention_v1_inputs(q, k_pool, v_pool, block_tables, context_lens, out_opt);
 
 #if defined(HAVE_CUDA_RUNTIME) && defined(HAVE_CUDA_STREAM)

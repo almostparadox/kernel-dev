@@ -442,6 +442,8 @@ def paged_attention_splitkv_reference(
     )
     if num_splits < 1:
         raise ValueError(f"num_splits must be at least 1, got {num_splits}")
+    if num_splits > 128:
+        raise ValueError(f"num_splits must be <= 128, got {num_splits}")
 
     if scale <= 0.0:
         scale = 1.0 / math.sqrt(head_dim)
@@ -556,6 +558,8 @@ def paged_attention_splitkv(
     )
     if num_splits < 1:
         raise ValueError(f"num_splits must be at least 1, got {num_splits}")
+    if num_splits > 128:
+        raise ValueError(f"num_splits must be <= 128, got {num_splits}")
 
     if scale <= 0.0:
         scale = 1.0 / math.sqrt(head_dim)

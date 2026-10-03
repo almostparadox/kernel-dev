@@ -624,6 +624,11 @@ def test_splitkv_validation_errors():
             q, k_pool, v_pool, block_tables, context_lens, num_splits=0
         )
 
+    with pytest.raises(ValueError, match="num_splits must be <= 128"):
+        paged_attention_splitkv(
+            q, k_pool, v_pool, block_tables, context_lens, num_splits=129
+        )
+
 
 def test_splitkv_reference_parity():
     """Verify that paged_attention_splitkv_reference matches paged_attention_reference."""
@@ -671,3 +676,4 @@ def test_splitkv_cuda_no_silent_fallback_enforcement():
         mod = load_cpp_extension()
         assert mod is not None, "CUDA extension must load on CUDA device"
         assert hasattr(mod, "paged_attention_splitkv"), "mod must have paged_attention_splitkv"
+

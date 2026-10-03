@@ -380,16 +380,19 @@ extern "C" void paged_attention_splitkv_launcher(
         return;
     }
 
-    bool local_alloc = (tmp_out == nullptr || tmp_metadata == nullptr);
+    bool alloc_out = (tmp_out == nullptr);
+    bool alloc_meta = (tmp_metadata == nullptr);
     float* d_tmp_out = tmp_out;
     float* d_tmp_meta = tmp_metadata;
 
-    if (local_alloc) {
+    if (alloc_out) {
         size_t tmp_out_bytes =
             static_cast<size_t>(batch_size) * num_heads * num_splits * head_dim * sizeof(float);
+        cudaMalloc(reinterpret_cast<void**>(&d_tmp_out), tmp_out_bytes);
+    }
+    if (alloc_meta) {
         size_t tmp_meta_bytes =
             static_cast<size_t>(batch_size) * num_heads * num_splits * 2 * sizeof(float);
-        cudaMalloc(reinterpret_cast<void**>(&d_tmp_out), tmp_out_bytes);
         cudaMalloc(reinterpret_cast<void**>(&d_tmp_meta), tmp_meta_bytes);
     }
 
@@ -472,9 +475,13 @@ extern "C" void paged_attention_splitkv_launcher(
         );
     }
 
-    if (local_alloc) {
+    if (alloc_out || alloc_meta) {
         cudaStreamSynchronize(stream);
+    }
+    if (alloc_out) {
         cudaFree(d_tmp_out);
+    }
+    if (alloc_meta) {
         cudaFree(d_tmp_meta);
     }
 }
