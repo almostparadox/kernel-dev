@@ -27,7 +27,7 @@ import platform
 import sys
 import time
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence  # noqa: UP035, F401
 
 import torch
 import torch.nn.functional as F
