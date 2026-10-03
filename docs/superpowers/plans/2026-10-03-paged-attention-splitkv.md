@@ -10,18 +10,19 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-03-paged-attention-splitkv-design.md`
 
-## Authoritative Literature & Standards
-- **PagedAttention:** Woosuk Kwon et al., *Efficient Memory Management for Large Language Model Serving with PagedAttention*, SOSP 2023 [arXiv:2309.06180](https://arxiv.org/abs/2309.06180).
-- **FlashAttention-2:** Tri Dao, *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning*, ICLR 2024 [arXiv:2307.08691](https://arxiv.org/abs/2307.08691).
-- **Flash-Decoding:** Tri Dao et al., *Flash-Decoding for Long-Context Inference*, Stanford CRFM 2023 [https://crfm.stanford.edu/2023/10/12/flashdecoding.html](https://crfm.stanford.edu/2023/10/12/flashdecoding.html).
-- **Online Softmax:** Maxim Milakov & Natalia Gimelshein, *Online normalizer calculation for softmax*, 2018 [arXiv:1805.02867](https://arxiv.org/abs/1805.02867).
+## Authoritative Literature & Standards (IEEE Style)
+- [1] W. Kwon et al., "Efficient memory management for large language model serving with PagedAttention," in *Proc. SOSP '23*, 2023, pp. 611–626. doi: [10.1145/3600006.3613165](https://doi.org/10.1145/3600006.3613165).
+- [2] T. Dao et al., "FlashAttention: Fast and memory-efficient exact attention with IO-awareness," in *Proc. NeurIPS 2022*, vol. 35, 2022, pp. 16344–16359.
+- [3] T. Dao, "FlashAttention-2: Faster attention with better parallelism and work partitioning," in *Proc. ICLR 2024*, 2024. arXiv: [2307.08691](https://arxiv.org/abs/2307.08691).
+- [4] T. Dao, D. Haziza, F. Massa, and G. Sizov, "Flash-Decoding for long-context inference," *Stanford CRFM*, 2023. [Online]. Available: https://crfm.stanford.edu/2023/10/12/flashdecoding.html
+- [5] M. Milakov and N. Gimelshein, "Online normalizer calculation for softmax," *arXiv preprint arXiv:1805.02867*, 2018. doi: [10.48550/arXiv.1805.02867](https://doi.org/10.48550/arXiv.1805.02867).
 
 ## Global Constraints
-- Token block size $B = 16$ tokens per physical page (Kwon et al. 2023 Section 3.2).
+- Token block size $B = 16$ tokens per physical page ([1], Section 3.2).
 - Supported head dimensions: $d \in \{64, 128\}$.
 - Data type: IEEE 754 Half-Precision (`half` / `torch.float16`).
 - Vectorized memory transfers: All memory accesses to KV blocks must use 128-bit `float4` transactions (8 `half` values per instruction).
-- Numerically stable online softmax using running max $m$ and sum-of-exponentials $l$ (Milakov & Gimelshein 2018).
+- Numerically stable online softmax using running max $m$ and sum-of-exponentials $l$ ([5]).
 
 ---
 

@@ -9,25 +9,25 @@
 
 ## 1. Executive Summary & Problem Formulation
 
-Standard LLM autoregressive inference suffers from severe memory fragmentation and memory-bandwidth bottlenecks during the decode phase ($M=1$ token generation) [Kwon et al., 2023].
+Standard LLM autoregressive inference suffers from severe memory fragmentation and memory-bandwidth bottlenecks during the decode phase ($M=1$ token generation) [1].
 
 ### 1.1 Memory Fragmentation in Contiguous Allocations
 Vanilla PyTorch allocates contiguous tensors for Key-Value (KV) caches:
 $$\text{Shape} = [\text{Batch}, \text{NumHeads}, \text{MaxSeqLen}, \text{HeadDim}]$$
 
-Because sequence lengths vary per request, static pre-allocation wastes 60% to 80% of GPU HBM via [Kwon et al., 2023]:
+Because sequence lengths vary per request, static pre-allocation wastes 60% to 80% of GPU HBM via [1]:
 1. **Internal Fragmentation:** Reserved space for ungenerated tokens up to `MaxSeqLen`.
 2. **External Fragmentation:** Dynamic reallocations create discontinuous memory holes across requests.
 3. **Sharing Barriers:** Inability to share prompt KV caches across parallel sampling beams or system prompts.
 
 ### 1.2 Underutilization in Long-Context Decode
-During single-token decode ($M=1$), computing attention against long contexts ($L \ge 2048$) underutilizes modern GPU compute capability [Dao et al., 2023]. A single thread-block per attention head starves the Streaming Multiprocessors (SMs), turning the operation into a pure DRAM-latency bottleneck.
+During single-token decode ($M=1$), computing attention against long contexts ($L \ge 2048$) underutilizes modern GPU compute capability [4]. A single thread-block per attention head starves the Streaming Multiprocessors (SMs), turning the operation into a pure DRAM-latency bottleneck.
 
 ### 1.3 Proposed System Solution
 This system implements:
-1. **PagedAttention CUDA Kernels:** Virtual-memory mapped KV cache with fixed-size physical pages ($B=16$ tokens) [Kwon et al., 2023].
-2. **FlashDecoding (Split-KV):** Context partitioning along the sequence dimension ($L$) into $K$ parallel splits across independent SMs, followed by an online log-sum-exp reduction kernel [Dao et al., 2023].
-3. **Virtual Memory Host Allocator:** A zero-fragmentation page table manager in Python mirroring OS page tables.
+1. **PagedAttention CUDA Kernels:** Virtual-memory mapped KV cache with fixed-size physical pages ($B=16$ tokens) [1].
+2. **FlashDecoding (Split-KV):** Context partitioning along the sequence dimension ($L$) into $K$ parallel splits across independent SMs, followed by an online log-sum-exp reduction kernel [4].
+3. **Virtual Memory Host Allocator:** A zero-fragmentation page table manager in Python mirroring OS page tables [1].
 
 ---
 
@@ -51,7 +51,7 @@ For query vector $\mathbf{q} \in \mathbb{R}^d$ and scaling factor $\sigma = \fra
 At any step over tokens $t \in [0, L_s - 1]$:
 $$S_t = \sigma (\mathbf{q} \cdot \mathbf{k}_t)$$
 
-Online numerical stabilization maintains running maximum $m^{(t)}$ and running denominator $l^{(t)}$ [Milakov & Gimelshein, 2018; Dao et al., 2022]:
+Online numerical stabilization maintains running maximum $m^{(t)}$ and running denominator $l^{(t)}$ [2], [5]:
 $$m^{(t)} = \max\left(m^{(t-1)}, S_t\right)$$
 $$\alpha = \exp\left(m^{(t-1)} - m^{(t)}\right)$$
 $$l^{(t)} = \alpha \cdot l^{(t-1)} + \exp\left(S_t - m^{(t)}\right)$$
@@ -63,7 +63,7 @@ Final normalized output:
 $$\mathbf{O} = \frac{\mathbf{o}^{(L_s - 1)}}{l^{(L_s - 1)}}$$
 
 ### 2.3 Split-KV (FlashDecoding) Two-Stage Reduction
-For context split into $K$ disjoint chunks along the sequence axis, each split $k \in [0, K-1]$ computes local partial results [Dao et al., 2023]:
+For context split into $K$ disjoint chunks along the sequence axis, each split $k \in [0, K-1]$ computes local partial results [4]:
 $$\mathbf{o}_k \in \mathbb{R}^d, \quad m_k \in \mathbb{R}, \quad l_k \in \mathbb{R}$$
 
 Stage 2 reduction merges the $K$ splits:
@@ -186,22 +186,18 @@ extern "C" void launch_paged_attention_v1(
 
 ---
 
-## 8. Authoritative References & Citations
+## 8. References (IEEE Style)
 
-1. **PagedAttention & vLLM:**
-   - Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Haotong Zhang, and Ion Stoica. 2023. *Efficient Memory Management for Large Language Model Serving with PagedAttention*. In Proceedings of the 29th ACM Symposium on Operating Systems Principles (SOSP '23). arXiv:2309.06180 [cs.OS]. [https://arxiv.org/abs/2309.06180](https://arxiv.org/abs/2309.06180)
-   - Official Repository: [vLLM Project](https://github.com/vllm-project/vllm)
+[1] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, and I. Stoica, "Efficient memory management for large language model serving with PagedAttention," in *Proceedings of the 29th ACM Symposium on Operating Systems Principles (SOSP '23)*, Koblenz, Germany, 2023, pp. 611–626. doi: [10.1145/3600006.3613165](https://doi.org/10.1145/3600006.3613165).
 
-2. **FlashAttention & FlashAttention-2:**
-   - Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. 2022. *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*. Advances in Neural Information Processing Systems (NeurIPS 2022). arXiv:2205.14135 [cs.LG]. [https://arxiv.org/abs/2205.14135](https://arxiv.org/abs/2205.14135)
-   - Tri Dao. 2023. *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning*. International Conference on Learning Representations (ICLR 2024). arXiv:2307.08691 [cs.LG]. [https://arxiv.org/abs/2307.08691](https://arxiv.org/abs/2307.08691)
+[2] T. Dao, D. Y. Fu, S. Ermon, A. Rudra, and C. Ré, "FlashAttention: Fast and memory-efficient exact attention with IO-awareness," in *Advances in Neural Information Processing Systems (NeurIPS 2022)*, vol. 35, 2022, pp. 16344–16359.
 
-3. **Flash-Decoding for Long-Context Serving:**
-   - Tri Dao, Daniel Haziza, Francisco Massa, and Grigory Sizov. 2023. *Flash-Decoding for Long-Context Inference*. Stanford CRFM Blog. [https://crfm.stanford.edu/2023/10/12/flashdecoding.html](https://crfm.stanford.edu/2023/10/12/flashdecoding.html)
+[3] T. Dao, "FlashAttention-2: Faster attention with better parallelism and work partitioning," in *International Conference on Learning Representations (ICLR 2024)*, Vienna, Austria, 2024. arXiv: [2307.08691](https://arxiv.org/abs/2307.08691).
 
-4. **Online Softmax Algorithms:**
-   - Maxim Milakov and Natalia Gimelshein. 2018. *Online normalizer calculation for softmax*. arXiv:1805.02867 [cs.DS]. [https://arxiv.org/abs/1805.02867](https://arxiv.org/abs/1805.02867)
+[4] T. Dao, D. Haziza, F. Massa, and G. Sizov, "Flash-Decoding for long-context inference," *Stanford Center for Research on Foundation Models (CRFM)*, Oct. 2023. [Online]. Available: https://crfm.stanford.edu/2023/10/12/flashdecoding.html
 
-5. **NVIDIA Hardware & CUDA Architecture:**
-   - NVIDIA Corporation. 2024. *CUDA C++ Programming Guide (Release 12.x)*. Sections: "Warp Shuffle Functions", "Vectorized Memory Accesses", "Ampere sm_80 Architecture Tuning". [https://docs.nvidia.com/cuda/cuda-c-programming-guide/](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
-   - NVIDIA Corporation. 2020. *NVIDIA A100 Tensor Core GPU Architecture Whitepaper*. [https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf](https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf)
+[5] M. Milakov and N. Gimelshein, "Online normalizer calculation for softmax," *arXiv preprint arXiv:1805.02867*, 2018. doi: [10.48550/arXiv.1805.02867](https://doi.org/10.48550/arXiv.1805.02867).
+
+[6] NVIDIA Corporation, *CUDA C++ Programming Guide (Release 12.x)*, Santa Clara, CA, USA, 2024. [Online]. Available: https://docs.nvidia.com/cuda/cuda-c-programming-guide/
+
+[7] NVIDIA Corporation, *NVIDIA A100 Tensor Core GPU Architecture: Unprecedented Acceleration at Every Scale*, Whitepaper WP-10019-001_v01, Santa Clara, CA, USA, 2020. [Online]. Available: https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf
