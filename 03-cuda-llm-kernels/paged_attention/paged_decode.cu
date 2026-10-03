@@ -31,11 +31,14 @@ __global__ void paged_attention_v1_kernel(
         return;
     }
 
+    constexpr int NUM_WARPS = 4;
+    constexpr int TOKENS_PER_WARP_REDUCTION = BLOCK_SIZE / NUM_WARPS;
+
     // Shared memory allocations
     alignas(16) __shared__ half s_q[HEAD_DIM];
     __shared__ float s_logits[BLOCK_SIZE];
-    __shared__ float s_warp_max[4];
-    __shared__ float s_warp_sum[4];
+    __shared__ float s_warp_max[NUM_WARPS];
+    __shared__ float s_warp_sum[NUM_WARPS];
     __shared__ float s_block_max;
     __shared__ float s_block_sum;
 
@@ -62,7 +65,7 @@ __global__ void paged_attention_v1_kernel(
     // Work partitioning: 4 warps process blocks of tokens cooperatively
     constexpr int THREADS_PER_TOKEN = HEAD_DIM / 8;
     constexpr int TOKENS_PER_WARP = WARP_SIZE / THREADS_PER_TOKEN;
-    constexpr int TOKENS_PER_STEP = 4 * TOKENS_PER_WARP;
+    constexpr int TOKENS_PER_STEP = NUM_WARPS * TOKENS_PER_WARP;
     constexpr int NUM_STEPS = (BLOCK_SIZE + TOKENS_PER_STEP - 1) / TOKENS_PER_STEP;
 
     const int group_id = lane_id / THREADS_PER_TOKEN;
@@ -71,6 +74,9 @@ __global__ void paged_attention_v1_kernel(
     // Loop over logical blocks
     for (int b = 0; b < num_blocks; ++b) {
         const int p_block = block_tables[seq_idx * max_blocks_per_seq + b];
+        if (p_block < 0) {
+            break;
+        }
 
         const half* k_block = k_pool + (static_cast<size_t>(p_block) * num_heads + head_idx) * (BLOCK_SIZE * HEAD_DIM);
         const half* v_block = v_pool + (static_cast<size_t>(p_block) * num_heads + head_idx) * (BLOCK_SIZE * HEAD_DIM);
@@ -116,15 +122,15 @@ __global__ void paged_attention_v1_kernel(
         if (lane_id == 0) {
             float w_max = -INFINITY;
             #pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                w_max = fmaxf(w_max, s_logits[warp_id * 4 + k]);
+            for (int k = 0; k < TOKENS_PER_WARP_REDUCTION; ++k) {
+                w_max = fmaxf(w_max, s_logits[warp_id * TOKENS_PER_WARP_REDUCTION + k]);
             }
             s_warp_max[warp_id] = w_max;
         }
         __syncthreads();
 
         if (warp_id == 0) {
-            float val = (lane_id < 4) ? s_warp_max[lane_id] : -INFINITY;
+            float val = (lane_id < NUM_WARPS) ? s_warp_max[lane_id] : -INFINITY;
             val = warp_reduce_max(val);
             if (lane_id == 0) {
                 s_block_max = val;
@@ -148,15 +154,15 @@ __global__ void paged_attention_v1_kernel(
         if (lane_id == 0) {
             float w_sum = 0.0f;
             #pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                w_sum += s_logits[warp_id * 4 + k];
+            for (int k = 0; k < TOKENS_PER_WARP_REDUCTION; ++k) {
+                w_sum += s_logits[warp_id * TOKENS_PER_WARP_REDUCTION + k];
             }
             s_warp_sum[warp_id] = w_sum;
         }
         __syncthreads();
 
         if (warp_id == 0) {
-            float val = (lane_id < 4) ? s_warp_sum[lane_id] : 0.0f;
+            float val = (lane_id < NUM_WARPS) ? s_warp_sum[lane_id] : 0.0f;
             val = warp_reduce_sum(val);
             if (lane_id == 0) {
                 s_block_sum = val;
@@ -197,7 +203,7 @@ __global__ void paged_attention_v1_kernel(
     // Final normalization: O = o_running / l_running, written via float4
     if (tid < HEAD_DIM / 8) {
         float inv_l = (l_running > 0.0f) ? (1.0f / l_running) : 0.0f;
-        half out_h[8];
+        alignas(16) half out_h[8];
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
             out_h[j] = __float2half(o_running[j] * inv_l);
