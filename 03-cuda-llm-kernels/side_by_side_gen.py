@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import inspect
 import math
 import os
 import sys
@@ -166,6 +167,7 @@ class CustomPagedAttention(torch.nn.Module):
         self.manager = SequenceBlockTableManager(self.allocator, block_size=BLOCK_SIZE)
         self.k_pool: torch.Tensor = torch.empty(0)
         self.v_pool: torch.Tensor = torch.empty(0)
+        self._num_outputs: int = 3
 
     def reset_cache(self, device: torch.device):
         self.allocator = PagedBlockAllocator(total_blocks=self.max_blocks, block_size=BLOCK_SIZE)
@@ -186,24 +188,54 @@ class CustomPagedAttention(torch.nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
+        past_key_value=None,
         past_key_values=None,
         **kwargs,
     ):
+        pkv = (
+            past_key_value
+            if past_key_value is not None
+            else (
+                past_key_values
+                if past_key_values is not None
+                else kwargs.get("past_key_values", kwargs.get("past_key_value"))
+            )
+        )
         seq_len = hidden_states.shape[1]
         device = hidden_states.device
 
         if seq_len > 1:
             # Prefill phase: initialize paged cache and populate with prompt KV
             self.reset_cache(device)
-            out = self.orig_attn(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                **kwargs,
-            )
-            if past_key_values is not None:
-                k_cache, v_cache = get_kv_from_cache(past_key_values, self.layer_idx)
+            call_kwargs = dict(kwargs)
+            try:
+                params = inspect.signature(self.orig_attn.forward).parameters
+                if "position_embeddings" in params:
+                    call_kwargs["position_embeddings"] = position_embeddings
+                if "attention_mask" in params:
+                    call_kwargs["attention_mask"] = attention_mask
+                if pkv is not None:
+                    if "past_key_values" in params:
+                        call_kwargs["past_key_values"] = pkv
+                    elif "past_key_value" in params:
+                        call_kwargs["past_key_value"] = pkv
+                    else:
+                        call_kwargs["past_key_value"] = pkv
+            except Exception:
+                call_kwargs["position_embeddings"] = position_embeddings
+                call_kwargs["attention_mask"] = attention_mask
+                if pkv is not None:
+                    call_kwargs["past_key_value"] = pkv
+
+            out = self.orig_attn(hidden_states, **call_kwargs)
+
+            if isinstance(out, tuple):
+                self._num_outputs = len(out)
+            else:
+                self._num_outputs = 2
+
+            if pkv is not None:
+                k_cache, v_cache = get_kv_from_cache(pkv, self.layer_idx)
                 if k_cache is not None and v_cache is not None:
                     self.manager.allocate_sequence(0, seq_len)
                     k_rep = k_cache.repeat_interleave(self.num_kv_groups, dim=1).to(torch.float16)
@@ -237,8 +269,8 @@ class CustomPagedAttention(torch.nn.Module):
             cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_values is not None:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+        if pkv is not None:
+            key_states, value_states = pkv.update(key_states, value_states, self.layer_idx)
 
         # Update paged KV cache tables
         self.manager.append_token(0)
@@ -269,7 +301,13 @@ class CustomPagedAttention(torch.nn.Module):
 
         attn_out = attn_out.view(*input_shape, -1).contiguous()
         attn_output = self.orig_attn.o_proj(attn_out)
-        return attn_output, None
+
+        num_outs = getattr(self, "_num_outputs", 3)
+        if num_outs == 3:
+            return attn_output, None, pkv
+        elif num_outs == 2:
+            return attn_output, None
+        return attn_output, None, pkv
 
 
 def generate_with_timing(model, tokenizer, prompt: str, max_new_tokens: int = 60):
