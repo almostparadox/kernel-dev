@@ -11,6 +11,9 @@ import torch.nn.functional as F
 from paged_attention.ops import (
     BLOCK_SIZE,
     load_cpp_extension,
+    paged_attention_reference,
+    paged_attention_splitkv,
+    paged_attention_splitkv_reference,
     paged_attention_v1,
 )
 from paged_attention.paged_allocator import (
@@ -30,10 +33,14 @@ def _setup_paged_kv_data(
     device: torch.device,
     dtype: torch.dtype = torch.float16,
     scramble_blocks: bool = False,
+    total_blocks: int | None = None,
 ):
     """Helper to populate physical KV pool and build ground-truth unpaged tensors."""
     batch_size = len(batch_lens)
-    allocator = PagedBlockAllocator(total_blocks=256, block_size=BLOCK_SIZE)
+    needed_blocks = sum((length + BLOCK_SIZE - 1) // BLOCK_SIZE for length in batch_lens)
+    if total_blocks is None:
+        total_blocks = max(256, needed_blocks + 64)
+    allocator = PagedBlockAllocator(total_blocks=total_blocks, block_size=BLOCK_SIZE)
 
     if scramble_blocks:
         # Pre-allocate and release dummy blocks to scramble free list
@@ -420,3 +427,247 @@ def test_cuda_no_silent_fallback_enforcement():
         mod = load_cpp_extension()
         assert mod is not None, "CUDA extension must load on CUDA device"
         assert hasattr(mod, "paged_attention_v1"), "mod must have paged_attention_v1"
+
+
+@pytest.mark.parametrize("device_str", DEVICES)
+@pytest.mark.parametrize("length", [2048, 4096, 8192])
+@pytest.mark.parametrize("num_splits", [4, 8])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_splitkv_long_context_parity(
+    device_str: str, length: int, num_splits: int, head_dim: int
+):
+    """Verify FlashDecoding Split-KV kernels against PyTorch SDPA on long contexts L in [2048, 4096, 8192]."""
+    torch.manual_seed(42 + length)
+    device = torch.device(device_str)
+    num_heads = 2
+    batch_lens = [length]
+    scale = 1.0 / math.sqrt(head_dim)
+
+    (
+        q,
+        k_pool,
+        v_pool,
+        block_tables,
+        context_lens,
+        k_unpaged,
+        v_unpaged,
+    ) = _setup_paged_kv_data(batch_lens, num_heads, head_dim, device)
+
+    out = paged_attention_splitkv(
+        q,
+        k_pool,
+        v_pool,
+        block_tables,
+        context_lens,
+        num_splits=num_splits,
+        scale=scale,
+    )
+    ref = _compute_unpaged_sdpa_reference(
+        q, k_unpaged, v_unpaged, batch_lens, scale=scale
+    )
+
+    max_err = (out - ref).abs().max().item()
+    mse = ((out - ref) ** 2).mean().item()
+
+    assert max_err < 1e-3, (
+        f"Max error {max_err} >= 1e-3 on {device_str} for L={length}, K={num_splits}, d={head_dim}"
+    )
+    assert mse < 1e-5, (
+        f"MSE {mse} >= 1e-5 on {device_str} for L={length}, K={num_splits}, d={head_dim}"
+    )
+
+
+@pytest.mark.parametrize("device_str", DEVICES)
+@pytest.mark.parametrize("num_splits", [2, 4, 8])
+def test_splitkv_variable_lens_batch(device_str: str, num_splits: int):
+    """Test FlashDecoding Split-KV across a batch with variable sequence lengths."""
+    torch.manual_seed(101)
+    device = torch.device(device_str)
+    batch_lens = [128, 512, 2048]
+    num_heads = 4
+    head_dim = 64
+    scale = 1.0 / math.sqrt(head_dim)
+
+    (
+        q,
+        k_pool,
+        v_pool,
+        block_tables,
+        context_lens,
+        k_unpaged,
+        v_unpaged,
+    ) = _setup_paged_kv_data(batch_lens, num_heads, head_dim, device)
+
+    out_split = paged_attention_splitkv(
+        q,
+        k_pool,
+        v_pool,
+        block_tables,
+        context_lens,
+        num_splits=num_splits,
+        scale=scale,
+    )
+    out_v1 = paged_attention_v1(
+        q,
+        k_pool,
+        v_pool,
+        block_tables,
+        context_lens,
+        scale=scale,
+    )
+    ref = _compute_unpaged_sdpa_reference(
+        q, k_unpaged, v_unpaged, batch_lens, scale=scale
+    )
+
+    max_err_split = (out_split - ref).abs().max().item()
+    mse_split = ((out_split - ref) ** 2).mean().item()
+    max_err_v1_diff = (out_split - out_v1).abs().max().item()
+
+    assert max_err_split < 1e-3, f"Split-KV max error {max_err_split} >= 1e-3"
+    assert mse_split < 1e-5, f"Split-KV MSE {mse_split} >= 1e-5"
+    assert max_err_v1_diff < 1e-3, f"Split-KV vs V1 discrepancy {max_err_v1_diff} >= 1e-3"
+
+
+@pytest.mark.parametrize("device_str", DEVICES)
+def test_splitkv_zero_length_sequence(device_str: str):
+    """Test Split-KV on a batch containing empty sequences (context_len = 0)."""
+    torch.manual_seed(202)
+    device = torch.device(device_str)
+    batch_lens = [0, 2048, 0]
+    head_dim = 64
+    num_heads = 2
+    scale = 1.0 / math.sqrt(head_dim)
+
+    (
+        q,
+        k_pool,
+        v_pool,
+        block_tables,
+        context_lens,
+        k_unpaged,
+        v_unpaged,
+    ) = _setup_paged_kv_data(batch_lens, num_heads, head_dim, device)
+
+    out = paged_attention_splitkv(
+        q, k_pool, v_pool, block_tables, context_lens, num_splits=4, scale=scale
+    )
+
+    assert (out[0] == 0.0).all().item(), "Seq 0 should be all zeros"
+    assert (out[2] == 0.0).all().item(), "Seq 2 should be all zeros"
+
+    ref = _compute_unpaged_sdpa_reference(
+        q, k_unpaged, v_unpaged, batch_lens, scale=scale
+    )
+    max_err = (out[1] - ref[1]).abs().max().item()
+    assert max_err < 1e-3, f"Active sequence max error {max_err} >= 1e-3"
+
+
+@pytest.mark.parametrize("device_str", DEVICES)
+def test_splitkv_preallocated_out(device_str: str):
+    """Test in-place accumulation with preallocated output tensor for Split-KV."""
+    torch.manual_seed(303)
+    device = torch.device(device_str)
+    batch_lens = [512, 1024]
+    head_dim = 64
+    num_heads = 2
+    scale = 1.0 / math.sqrt(head_dim)
+
+    (
+        q,
+        k_pool,
+        v_pool,
+        block_tables,
+        context_lens,
+        k_unpaged,
+        v_unpaged,
+    ) = _setup_paged_kv_data(batch_lens, num_heads, head_dim, device)
+
+    out_buf = torch.empty_like(q)
+    ret = paged_attention_splitkv(
+        q,
+        k_pool,
+        v_pool,
+        block_tables,
+        context_lens,
+        num_splits=4,
+        scale=scale,
+        out=out_buf,
+    )
+
+    assert ret is out_buf, "Should return identical preallocated tensor"
+    ref = _compute_unpaged_sdpa_reference(
+        q, k_unpaged, v_unpaged, batch_lens, scale=scale
+    )
+    max_err = (out_buf - ref).abs().max().item()
+    assert max_err < 1e-3, f"Preallocated output error {max_err} >= 1e-3"
+
+
+def test_splitkv_validation_errors():
+    """Test Split-KV input validation specifically on num_splits."""
+    device = torch.device("cpu")
+    batch_lens = [16]
+    head_dim = 64
+    num_heads = 2
+
+    (
+        q,
+        k_pool,
+        v_pool,
+        block_tables,
+        context_lens,
+        _,
+        _,
+    ) = _setup_paged_kv_data(batch_lens, num_heads, head_dim, device)
+
+    with pytest.raises(ValueError, match="num_splits must be at least 1"):
+        paged_attention_splitkv(
+            q, k_pool, v_pool, block_tables, context_lens, num_splits=0
+        )
+
+
+def test_splitkv_reference_parity():
+    """Verify that paged_attention_splitkv_reference matches paged_attention_reference."""
+    torch.manual_seed(99)
+    device = torch.device("cpu")
+    batch_lens = [32, 64]
+    head_dim = 64
+    num_heads = 2
+    scale = 1.0 / math.sqrt(head_dim)
+
+    (
+        q,
+        k_pool,
+        v_pool,
+        block_tables,
+        context_lens,
+        _,
+        _,
+    ) = _setup_paged_kv_data(batch_lens, num_heads, head_dim, device)
+
+    out_ref = paged_attention_reference(
+        q, k_pool, v_pool, block_tables, context_lens, scale=scale
+    )
+    out_split_ref = paged_attention_splitkv_reference(
+        q, k_pool, v_pool, block_tables, context_lens, num_splits=4, scale=scale
+    )
+
+    diff = (out_ref - out_split_ref).abs().max().item()
+    assert diff < 1e-3, f"Split-KV reference differs from V1 reference: {diff}"
+
+
+def test_splitkv_cuda_no_silent_fallback_enforcement():
+    """Verify that calling paged_attention_splitkv on CUDA enforces extension presence."""
+    if not torch.cuda.is_available():
+        q = torch.randn(1, 2, 64, dtype=torch.float16)
+        k_pool = torch.randn(1, 2, BLOCK_SIZE, 64, dtype=torch.float16)
+        v_pool = torch.randn(1, 2, BLOCK_SIZE, 64, dtype=torch.float16)
+        bt = torch.tensor([[0]], dtype=torch.int32)
+        ctx = torch.tensor([10], dtype=torch.int32)
+        out = paged_attention_splitkv(
+            q, k_pool, v_pool, bt, ctx, num_splits=2, force_cpu=True
+        )
+        assert out.shape == q.shape
+    else:
+        mod = load_cpp_extension()
+        assert mod is not None, "CUDA extension must load on CUDA device"
+        assert hasattr(mod, "paged_attention_splitkv"), "mod must have paged_attention_splitkv"

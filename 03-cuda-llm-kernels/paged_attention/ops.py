@@ -12,6 +12,7 @@ BLOCK_SIZE = 16
 
 _CPP_MODULE = None
 _CTYPES_LAUNCHER = None
+_CTYPES_SPLITKV_LAUNCHER = None
 
 
 def load_cpp_extension(build_directory: str | None = None, verbose: bool = False):
@@ -40,6 +41,7 @@ def load_cpp_extension(build_directory: str | None = None, verbose: bool = False
         sources = [
             str(src_dir / "paged_ops.cpp"),
             str(src_dir / "paged_decode.cu"),
+            str(src_dir / "paged_split_kv.cu"),
         ]
         all_exist = all(Path(s).exists() for s in sources)
         if not all_exist:
@@ -69,7 +71,7 @@ def load_cpp_extension(build_directory: str | None = None, verbose: bool = False
 
 def load_ctypes_lib(path: str | None = None) -> ctypes.CDLL | None:
     """Load precompiled PagedAttention shared library via ctypes."""
-    global _CTYPES_LAUNCHER
+    global _CTYPES_LAUNCHER, _CTYPES_SPLITKV_LAUNCHER
     if _CTYPES_LAUNCHER is not None and path is None:
         return _CTYPES_LAUNCHER
 
@@ -122,6 +124,32 @@ def load_ctypes_lib(path: str | None = None) -> ctypes.CDLL | None:
         ]
         launcher.restype = None
         _CTYPES_LAUNCHER = launcher
+
+    splitkv_launcher = getattr(lib, "launch_paged_attention_splitkv", None) or getattr(
+        lib, "paged_attention_splitkv_launcher", None
+    )
+    if splitkv_launcher is not None:
+        splitkv_launcher.argtypes = [
+            ctypes.c_void_p,  # out
+            ctypes.c_void_p,  # tmp_out
+            ctypes.c_void_p,  # tmp_metadata
+            ctypes.c_void_p,  # q
+            ctypes.c_void_p,  # k_pool
+            ctypes.c_void_p,  # v_pool
+            ctypes.c_void_p,  # block_tables
+            ctypes.c_void_p,  # context_lens
+            ctypes.c_int,  # max_blocks_per_seq
+            ctypes.c_int,  # batch_size
+            ctypes.c_int,  # num_heads
+            ctypes.c_int,  # head_dim
+            ctypes.c_int,  # num_splits
+            ctypes.c_float,  # scale
+            ctypes.c_void_p,  # stream
+        ]
+        splitkv_launcher.restype = None
+        _CTYPES_SPLITKV_LAUNCHER = splitkv_launcher
+
+    if _CTYPES_LAUNCHER is not None or _CTYPES_SPLITKV_LAUNCHER is not None:
         return lib
 
     return None
@@ -139,6 +167,18 @@ def is_ctypes_available() -> bool:
     if _CTYPES_LAUNCHER is not None:
         return True
     return load_ctypes_lib() is not None
+
+
+def is_splitkv_available() -> bool:
+    """Check if compiled Split-KV kernel is available via C++ extension or ctypes."""
+    mod = load_cpp_extension()
+    if mod is not None and hasattr(mod, "paged_attention_splitkv"):
+        return True
+    global _CTYPES_SPLITKV_LAUNCHER
+    if _CTYPES_SPLITKV_LAUNCHER is not None:
+        return True
+    _ = load_ctypes_lib()
+    return _CTYPES_SPLITKV_LAUNCHER is not None
 
 
 def _validate_inputs(
@@ -370,6 +410,206 @@ def paged_attention_v1(
             ctypes.c_int(batch_size),
             ctypes.c_int(num_heads),
             ctypes.c_int(head_dim),
+            ctypes.c_float(scale),
+            ctypes.c_void_p(stream),
+        )
+        return out
+
+    # 4. Strict CUDA enforcement: do NOT silently fallback to CPU reference simulator
+    raise RuntimeError(
+        "CUDA PagedAttention extension not available. Compile via scripts/compile_paged_ops.sh or load valid paged_attention.so"
+    )
+
+
+def paged_attention_splitkv_reference(
+    q: torch.Tensor,
+    k_pool: torch.Tensor,
+    v_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    num_splits: int = 4,
+    scale: float = 0.0,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Golden reference simulator for FlashDecoding Split-KV two-stage reduction.
+
+    Partitions context across num_splits intervals, computing local max, normalizer,
+    and partial accumulation vectors in Stage 1, followed by a log-sum-exp merge in Stage 2.
+    Runs on CPU or CUDA.
+    """
+    batch_size, num_heads, head_dim = _validate_inputs(
+        q, k_pool, v_pool, block_tables, context_lens, out
+    )
+    if num_splits < 1:
+        raise ValueError(f"num_splits must be at least 1, got {num_splits}")
+
+    if scale <= 0.0:
+        scale = 1.0 / math.sqrt(head_dim)
+
+    q_sq = q.squeeze(1) if q.dim() == 4 else q
+
+    if out is None:
+        out = torch.zeros(
+            (batch_size, num_heads, head_dim),
+            dtype=torch.float16,
+            device=q.device,
+        )
+    else:
+        out.zero_()
+
+    for seq_idx in range(batch_size):
+        ctx_len = int(context_lens[seq_idx].item())
+        if ctx_len <= 0:
+            continue
+
+        num_blocks = (ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        p_blocks = block_tables[seq_idx, :num_blocks].tolist()
+
+        k_blocks = k_pool[p_blocks]
+        v_blocks = v_pool[p_blocks]
+
+        # Reshape physical blocks to [num_heads, ctx_len, head_dim]
+        k_seq = k_blocks.permute(1, 0, 2, 3).reshape(num_heads, -1, head_dim)[:, :ctx_len, :]
+        v_seq = v_blocks.permute(1, 0, 2, 3).reshape(num_heads, -1, head_dim)[:, :ctx_len, :]
+
+        # Query vector: [num_heads, 1, head_dim]
+        q_seq = q_sq[seq_idx].unsqueeze(1).float()
+
+        # Stage 1: Partition sequence across num_splits and compute (m_k, l_k, o_k)
+        m_splits: list[torch.Tensor] = []
+        l_splits: list[torch.Tensor] = []
+        o_splits: list[torch.Tensor] = []
+
+        for k in range(num_splits):
+            start_t = (k * ctx_len) // num_splits
+            end_t = ((k + 1) * ctx_len) // num_splits
+
+            if start_t >= end_t:
+                m_splits.append(
+                    torch.full((num_heads, 1), -float("inf"), dtype=torch.float32, device=q.device)
+                )
+                l_splits.append(
+                    torch.zeros((num_heads, 1), dtype=torch.float32, device=q.device)
+                )
+                o_splits.append(
+                    torch.zeros((num_heads, 1, head_dim), dtype=torch.float32, device=q.device)
+                )
+                continue
+
+            k_split = k_seq[:, start_t:end_t, :].float()
+            v_split = v_seq[:, start_t:end_t, :].float()
+
+            # Scaled dot-product: [num_heads, 1, split_len]
+            scores = torch.matmul(q_seq, k_split.transpose(-1, -2)) * scale
+            m_k = scores.max(dim=-1, keepdim=True).values.squeeze(-1)  # [num_heads, 1]
+            p_k = torch.exp(scores - m_k.unsqueeze(-1))  # [num_heads, 1, split_len]
+            l_k = p_k.sum(dim=-1)  # [num_heads, 1]
+            o_k = torch.matmul(p_k, v_split)  # [num_heads, 1, head_dim]
+
+            m_splits.append(m_k)
+            l_splits.append(l_k)
+            o_splits.append(o_k)
+
+        # Stage 2: Cross-split log-sum-exp merge
+        m_stack = torch.stack(m_splits, dim=-1)  # [num_heads, 1, num_splits]
+        m_global = m_stack.max(dim=-1, keepdim=True).values  # [num_heads, 1, 1]
+
+        l_global = torch.zeros((num_heads, 1), dtype=torch.float32, device=q.device)
+        o_final = torch.zeros((num_heads, 1, head_dim), dtype=torch.float32, device=q.device)
+
+        for k in range(num_splits):
+            m_k = m_splits[k].unsqueeze(-1)  # [num_heads, 1, 1]
+            beta_k = torch.where(
+                m_k == -float("inf"),
+                torch.zeros_like(m_k),
+                torch.exp(m_k - m_global),
+            )  # [num_heads, 1, 1]
+            l_global = l_global + beta_k.squeeze(-1) * l_splits[k]
+            o_final = o_final + beta_k * o_splits[k]
+
+        inv_l = torch.where(l_global > 0.0, 1.0 / l_global, torch.zeros_like(l_global))
+        o_norm = (o_final * inv_l.unsqueeze(-1)).squeeze(1).to(torch.float16)
+        out[seq_idx] = o_norm
+
+    return out
+
+
+def paged_attention_splitkv(
+    q: torch.Tensor,
+    k_pool: torch.Tensor,
+    v_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    num_splits: int = 4,
+    scale: float = 0.0,
+    out: torch.Tensor | None = None,
+    force_cpu: bool = False,
+) -> torch.Tensor:
+    """Execute FlashDecoding Split-KV attention for long sequences.
+
+    Dispatches to compiled CUDA extension / ctypes shared library if on CUDA,
+    or falls back to the golden Split-KV reference simulator if on CPU or forced.
+    Raises RuntimeError if CUDA tensor is passed and CUDA extension is not loaded.
+    """
+    batch_size, num_heads, head_dim = _validate_inputs(
+        q, k_pool, v_pool, block_tables, context_lens, out
+    )
+    if num_splits < 1:
+        raise ValueError(f"num_splits must be at least 1, got {num_splits}")
+
+    if scale <= 0.0:
+        scale = 1.0 / math.sqrt(head_dim)
+
+    is_cuda = q.is_cuda or q.device.type == "cuda"
+
+    # 1. CPU execution or explicit force_cpu
+    if force_cpu or not is_cuda:
+        return paged_attention_splitkv_reference(
+            q,
+            k_pool,
+            v_pool,
+            block_tables,
+            context_lens,
+            num_splits=num_splits,
+            scale=scale,
+            out=out,
+        )
+
+    # 2. CUDA execution: try PyTorch C++ extension
+    mod = load_cpp_extension()
+    if mod is not None and hasattr(mod, "paged_attention_splitkv"):
+        return mod.paged_attention_splitkv(
+            q, k_pool, v_pool, block_tables, context_lens, num_splits, scale, out
+        )
+
+    # 3. CUDA execution: try ctypes shared library
+    _ = load_ctypes_lib()
+    global _CTYPES_SPLITKV_LAUNCHER
+    if _CTYPES_SPLITKV_LAUNCHER is not None:
+        q_sq = q.squeeze(1) if q.dim() == 4 else q
+        if out is None:
+            out = torch.empty(
+                (batch_size, num_heads, head_dim),
+                dtype=torch.float16,
+                device=q.device,
+            )
+        stream = torch.cuda.current_stream(q.device).cuda_stream
+        max_blocks_per_seq = block_tables.shape[1]
+
+        _CTYPES_SPLITKV_LAUNCHER(
+            ctypes.c_void_p(out.data_ptr()),
+            None,
+            None,
+            ctypes.c_void_p(q_sq.data_ptr()),
+            ctypes.c_void_p(k_pool.data_ptr()),
+            ctypes.c_void_p(v_pool.data_ptr()),
+            ctypes.c_void_p(block_tables.data_ptr()),
+            ctypes.c_void_p(context_lens.data_ptr()),
+            ctypes.c_int(max_blocks_per_seq),
+            ctypes.c_int(batch_size),
+            ctypes.c_int(num_heads),
+            ctypes.c_int(head_dim),
+            ctypes.c_int(num_splits),
             ctypes.c_float(scale),
             ctypes.c_void_p(stream),
         )

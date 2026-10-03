@@ -56,6 +56,25 @@ void paged_attention_v1_launcher(
     cudaStream_t stream
 );
 
+// Forward declaration of CUDA launcher defined in paged_split_kv.cu
+void paged_attention_splitkv_launcher(
+    half* out,
+    float* tmp_out,
+    float* tmp_metadata,
+    const half* q,
+    const half* k_pool,
+    const half* v_pool,
+    const int32_t* block_tables,
+    const int32_t* context_lens,
+    int max_blocks_per_seq,
+    int batch_size,
+    int num_heads,
+    int head_dim,
+    int num_splits,
+    float scale,
+    cudaStream_t stream
+);
+
 // C-linkage export for ctypes integration
 PAGED_EXPORT void launch_paged_attention_v1(
     half* out,
@@ -82,6 +101,43 @@ PAGED_EXPORT void launch_paged_attention_v1(
         batch_size,
         num_heads,
         head_dim,
+        scale,
+        stream
+    );
+}
+
+// C-linkage export for ctypes integration (Split-KV)
+PAGED_EXPORT void launch_paged_attention_splitkv(
+    half* out,
+    float* tmp_out,
+    float* tmp_metadata,
+    const half* q,
+    const half* k_pool,
+    const half* v_pool,
+    const int32_t* block_tables,
+    const int32_t* context_lens,
+    int max_blocks_per_seq,
+    int batch_size,
+    int num_heads,
+    int head_dim,
+    int num_splits,
+    float scale,
+    cudaStream_t stream
+) {
+    paged_attention_splitkv_launcher(
+        out,
+        tmp_out,
+        tmp_metadata,
+        q,
+        k_pool,
+        v_pool,
+        block_tables,
+        context_lens,
+        max_blocks_per_seq,
+        batch_size,
+        num_heads,
+        head_dim,
+        num_splits,
         scale,
         stream
     );
@@ -214,6 +270,73 @@ torch::Tensor paged_attention_v1(
 #endif
 }
 
+torch::Tensor paged_attention_splitkv(
+    const torch::Tensor& q,
+    const torch::Tensor& k_pool,
+    const torch::Tensor& v_pool,
+    const torch::Tensor& block_tables,
+    const torch::Tensor& context_lens,
+    int64_t num_splits = 4,
+    float scale = 0.0f,
+    c10::optional<torch::Tensor> out_opt = c10::nullopt
+) {
+    TORCH_CHECK(num_splits >= 1, "num_splits must be at least 1, got ", num_splits);
+    check_paged_attention_v1_inputs(q, k_pool, v_pool, block_tables, context_lens, out_opt);
+
+#if defined(HAVE_CUDA_RUNTIME) && defined(HAVE_CUDA_STREAM)
+    torch::Tensor q_sq = (q.dim() == 4 && q.size(1) == 1) ? q.squeeze(1) : q;
+    const int batch_size = static_cast<int>(q_sq.size(0));
+    const int num_heads = static_cast<int>(q_sq.size(1));
+    const int head_dim = static_cast<int>(q_sq.size(2));
+    const int max_blocks_per_seq = static_cast<int>(block_tables.size(1));
+    const int n_splits = static_cast<int>(num_splits);
+
+    torch::Tensor out;
+    if (out_opt.has_value()) {
+        out = out_opt.value();
+    } else {
+        out = torch::empty({batch_size, num_heads, head_dim}, q_sq.options());
+    }
+
+    torch::Tensor tmp_out = torch::empty(
+        {batch_size, num_heads, n_splits, head_dim},
+        q_sq.options().dtype(torch::kFloat32)
+    );
+    torch::Tensor tmp_meta = torch::empty(
+        {batch_size, num_heads, n_splits, 2},
+        q_sq.options().dtype(torch::kFloat32)
+    );
+
+    const float final_scale = (scale > 0.0f)
+        ? scale
+        : (1.0f / std::sqrt(static_cast<float>(head_dim)));
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream(q.get_device()).stream();
+
+    paged_attention_splitkv_launcher(
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        tmp_out.data_ptr<float>(),
+        tmp_meta.data_ptr<float>(),
+        reinterpret_cast<const half*>(q_sq.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(k_pool.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(v_pool.data_ptr<at::Half>()),
+        block_tables.data_ptr<int32_t>(),
+        context_lens.data_ptr<int32_t>(),
+        max_blocks_per_seq,
+        batch_size,
+        num_heads,
+        head_dim,
+        n_splits,
+        final_scale,
+        stream
+    );
+
+    return out;
+#else
+    TORCH_CHECK(false, "PagedAttention Split-KV CUDA kernel is not available (CUDA stream/runtime not compiled)");
+#endif
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "PagedAttention CUDA C++ Extension";
     m.def(
@@ -246,6 +369,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("v_pool"),
         py::arg("block_tables"),
         py::arg("context_lens"),
+        py::arg("scale") = 0.0f
+    );
+    m.def(
+        "paged_attention_splitkv",
+        &paged_attention_splitkv,
+        "FlashDecoding Split-KV long-context decode kernel",
+        py::arg("q"),
+        py::arg("k_pool"),
+        py::arg("v_pool"),
+        py::arg("block_tables"),
+        py::arg("context_lens"),
+        py::arg("num_splits") = 4,
+        py::arg("scale") = 0.0f,
+        py::arg("out") = py::none()
+    );
+    m.def(
+        "paged_attention_splitkv_out",
+        [](torch::Tensor& out,
+           const torch::Tensor& q,
+           const torch::Tensor& k_pool,
+           const torch::Tensor& v_pool,
+           const torch::Tensor& block_tables,
+           const torch::Tensor& context_lens,
+           int64_t num_splits,
+           float scale) {
+            return paged_attention_splitkv(q, k_pool, v_pool, block_tables, context_lens, num_splits, scale, out);
+        },
+        "FlashDecoding Split-KV long-context decode kernel (out passed first)",
+        py::arg("out"),
+        py::arg("q"),
+        py::arg("k_pool"),
+        py::arg("v_pool"),
+        py::arg("block_tables"),
+        py::arg("context_lens"),
+        py::arg("num_splits") = 4,
         py::arg("scale") = 0.0f
     );
 }
