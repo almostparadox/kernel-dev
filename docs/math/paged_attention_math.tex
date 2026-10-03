@@ -1,0 +1,159 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=magenta,
+    urlcolor=cyan
+}
+
+\title{\textbf{Mathematical Foundations of PagedAttention and FlashDecoding for LLM Inference}}
+\author{\textbf{Kernel Development Lab} \\ Hardware-Level Performance Engineering}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This technical report details the mathematical formulation, memory layout, and parallel reduction schemes for PagedAttention and FlashDecoding (Split-KV) in autoregressive Large Language Model (LLM) inference. We formalize the non-contiguous virtual-to-physical memory translation of Key-Value (KV) cache tensors and derive numerically stable online softmax formulations for both single-pass and multi-split parallel reductions on NVIDIA GPUs.
+\end{abstract}
+
+\section{Introduction and Problem Formulation}
+
+During the autoregressive decode phase of Transformer-based Large Language Models, a single token ($M=1$) is generated per step. At step $L$, the query vector $\mathbf{q} \in \mathbb{R}^{d}$ for a given attention head must compute dot-product attention against all prior context tokens $t \in [0, L-1]$ stored in the Key and Value caches:
+\begin{equation}
+\mathbf{k}_t, \mathbf{v}_t \in \mathbb{R}^{d}, \quad 0 \le t < L
+\end{equation}
+
+In standard implementations, KV caches are allocated contiguously in High-Bandwidth Memory (HBM):
+\begin{equation}
+\mathbf{K}, \mathbf{V} \in \mathbb{R}^{\text{Batch} \times \text{Heads} \times L_{\max} \times d}
+\end{equation}
+This leads to two critical inefficiencies:
+\begin{enumerate}
+    \item \textbf{Memory Fragmentation:} Up to $60\% - 80\%$ of GPU memory is stranded due to conservative pre-allocation for $L_{\max}$ and unpredictable request termination.
+    \item \textbf{Decode Underutilization:} For a single token ($M=1$), an attention head is mapped to a single thread block. When $L$ is large, Streaming Multiprocessors (SMs) suffer from low occupancy and DRAM latency bottlenecks.
+\end{enumerate}
+
+\section{Paged Memory Mapping}
+
+\subsection{Logical to Physical Block Translation}
+
+Let the context length of sequence $s$ be $L_s$. The sequence context is partitioned into logical blocks of uniform size $B$ (typically $B=16$ tokens).
+
+For any token index $t \in [0, L_s - 1]$:
+\begin{align}
+b_{\text{logical}}(t) &= \left\lfloor \frac{t}{B} \right\rfloor \\
+o(t) &= t \pmod B
+\end{align}
+where $b_{\text{logical}}(t)$ is the logical block index and $o(t)$ is the intra-block slot offset.
+
+A 2D block table $\mathcal{T} \in \mathbb{Z}^{S \times M_{\text{blocks}}}$ maps sequence $s$ and logical block index to a physical block index $p \in [0, N_{\text{blocks}} - 1]$:
+\begin{equation}
+p = \mathcal{T}[s, b_{\text{logical}}(t)]
+\end{equation}
+
+\subsection{Physical Memory Address Resolution}
+
+Let the global physical cache pools be allocated as 4D tensors:
+\begin{equation}
+\mathbf{K}_{\text{pool}}, \mathbf{V}_{\text{pool}} \in \mathbb{R}^{N_{\text{blocks}} \times H \times B \times d}
+\end{equation}
+
+For head index $h \in [0, H-1]$ and token offset $o \in [0, B-1]$, the exact element address offset in memory (assuming row-major order) is:
+\begin{equation}
+\text{Addr}(\mathbf{k}_t) = \text{Base}_K + \left( p \cdot H \cdot B \cdot d + h \cdot B \cdot d + o \cdot d \right) \times \text{sizeof}(\text{fp16})
+\end{equation}
+
+This enables dynamic page-level allocation without requiring contiguous physical HBM slabs across sequence lifetime.
+
+\section{Online Softmax and Single-Pass Decode}
+
+\subsection{Standard Softmax Hazard}
+Standard scaled dot-product attention computes:
+\begin{equation}
+S_t = \frac{\mathbf{q} \cdot \mathbf{k}_t}{\sqrt{d}}, \quad P_t = \frac{\exp(S_t)}{\sum_{\tau=0}^{L-1} \exp(S_\tau)}, \quad \mathbf{O} = \sum_{t=0}^{L-1} P_t \mathbf{v}_t
+\end{equation}
+Direct evaluation requires three passes over memory: (1) compute all $S_t$ and write to DRAM, (2) compute global maximum $m = \max_t S_t$ and sum of exponentials, (3) normalize and accumulate with $\mathbf{v}_t$.
+
+\subsection{Online Recurrence Formulation}
+
+To execute in a single memory pass within fast on-chip SRAM (Shared Memory and Registers), we maintain running state $(m^{(t)}, l^{(t)}, \mathbf{o}^{(t)})$:
+\begin{align}
+m^{(t)} &= \max\left( m^{(t-1)}, S_t \right) \\
+\alpha_t &= \exp\left( m^{(t-1)} - m^{(t)} \right) \\
+l^{(t)} &= \alpha_t \cdot l^{(t-1)} + \exp\left( S_t - m^{(t)} \right) \\
+\mathbf{o}^{(t)} &= \alpha_t \cdot \mathbf{o}^{(t-1)} + \exp\left( S_t - m^{(t)} \right) \mathbf{v}_t
+\end{align}
+with initial boundary conditions:
+\begin{equation}
+m^{(-1)} = -\infty, \quad l^{(-1)} = 0, \quad \mathbf{o}^{(-1)} = \mathbf{0}
+\end{equation}
+
+After consuming all $L_s$ tokens, the final attention output vector $\mathbf{O} \in \mathbb{R}^d$ is:
+\begin{equation}
+\mathbf{O} = \frac{\mathbf{o}^{(L_s - 1)}}{l^{(L_s - 1)}}
+\end{equation}
+
+\section{FlashDecoding (Split-KV) Parallel Reduction}
+
+When context length $L$ exceeds $2048$ tokens, serial block traversal within a single thread-block leaves the GPU compute cores starved. FlashDecoding splits the sequence dimension $L$ across $K$ parallel splits.
+
+\subsection{Stage 1: Partial Split Evaluation}
+The sequence $[0, L-1]$ is partitioned into $K$ intervals:
+\begin{equation}
+I_k = \left[ \left\lfloor \frac{k L}{K} \right\rfloor, \left\lfloor \frac{(k+1) L}{K} \right\rfloor - 1 \right], \quad k \in [0, K-1]
+\end{equation}
+
+Each split $k$ is executed by an independent CUDA thread block, producing:
+\begin{itemize}
+    \item Local maximum: $m_k = \max_{t \in I_k} S_t$
+    \item Local normalizer: $l_k = \sum_{t \in I_k} \exp(S_t - m_k)$
+    \item Unnormalized accumulator: $\mathbf{o}_k = \sum_{t \in I_k} \exp(S_t - m_k) \mathbf{v}_t$
+\end{itemize}
+
+\subsection{Stage 2: Cross-Split Log-Sum-Exp Merge}
+A second reduction kernel loads the $K$ tuples $(m_k, l_k, \mathbf{o}_k)$ for each $(s, h)$ pair.
+
+The global maximum across all splits is:
+\begin{equation}
+m_{\text{global}} = \max_{0 \le k < K} m_k
+\end{equation}
+
+Rescaling factors are computed:
+\begin{equation}
+\beta_k = \exp(m_k - m_{\text{global}})
+\end{equation}
+
+The global denominator is:
+\begin{equation}
+l_{\text{global}} = \sum_{k=0}^{K-1} \beta_k \cdot l_k
+\end{equation}
+
+The final output is computed by normalized convex combination:
+\begin{equation}
+\mathbf{O}_{\text{final}} = \frac{1}{l_{\text{global}}} \sum_{k=0}^{K-1} \beta_k \cdot \mathbf{o}_k
+\end{equation}
+
+\section{Hardware and Vectorization Invariants}
+
+\begin{enumerate}
+    \item \textbf{128-bit Vectorized Loads:} Key and Value elements are loaded using \texttt{float4} instructions, reading 8 FP16 values per transaction. $d$ must be a multiple of 8.
+    \item \textbf{Warp Shuffles:} Reductions across threads inside a 32-thread warp execute using \texttt{\_\_shfl\_down\_sync} instructions without shared memory latency.
+    \item \textbf{Shared Memory Limits:} Shared memory footprint per thread block is bounded by:
+    \begin{equation}
+    \text{SRAM} = d \times \text{sizeof}(\text{half}) + B \times \text{sizeof}(\text{float}) + \mathcal{O}(1) \le 4\text{ KB}
+    \end{equation}
+    permitting high occupancy on sm\_80 and sm\_89 architectures.
+\end{enumerate}
+
+\end{document}
