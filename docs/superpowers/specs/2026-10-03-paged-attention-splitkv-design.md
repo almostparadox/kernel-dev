@@ -9,24 +9,24 @@
 
 ## 1. Executive Summary & Problem Formulation
 
-Standard LLM autoregressive inference suffers from severe memory fragmentation and memory-bandwidth bottlenecks during the decode phase ($M=1$ token generation).
+Standard LLM autoregressive inference suffers from severe memory fragmentation and memory-bandwidth bottlenecks during the decode phase ($M=1$ token generation) [Kwon et al., 2023].
 
 ### 1.1 Memory Fragmentation in Contiguous Allocations
 Vanilla PyTorch allocates contiguous tensors for Key-Value (KV) caches:
 $$\text{Shape} = [\text{Batch}, \text{NumHeads}, \text{MaxSeqLen}, \text{HeadDim}]$$
 
-Because sequence lengths vary per request, static pre-allocation wastes 60% to 80% of GPU HBM via:
+Because sequence lengths vary per request, static pre-allocation wastes 60% to 80% of GPU HBM via [Kwon et al., 2023]:
 1. **Internal Fragmentation:** Reserved space for ungenerated tokens up to `MaxSeqLen`.
 2. **External Fragmentation:** Dynamic reallocations create discontinuous memory holes across requests.
 3. **Sharing Barriers:** Inability to share prompt KV caches across parallel sampling beams or system prompts.
 
 ### 1.2 Underutilization in Long-Context Decode
-During single-token decode ($M=1$), computing attention against long contexts ($L \ge 2048$) underutilizes modern GPU compute capability. A single thread-block per attention head starves the Streaming Multiprocessors (SMs), turning the operation into a pure DRAM-latency bottleneck.
+During single-token decode ($M=1$), computing attention against long contexts ($L \ge 2048$) underutilizes modern GPU compute capability [Dao et al., 2023]. A single thread-block per attention head starves the Streaming Multiprocessors (SMs), turning the operation into a pure DRAM-latency bottleneck.
 
 ### 1.3 Proposed System Solution
 This system implements:
-1. **PagedAttention CUDA Kernels:** Virtual-memory mapped KV cache with fixed-size physical pages ($B=16$ tokens).
-2. **FlashDecoding (Split-KV):** Context partitioning along the sequence dimension ($L$) into $K$ parallel splits across independent SMs, followed by an online log-sum-exp reduction kernel.
+1. **PagedAttention CUDA Kernels:** Virtual-memory mapped KV cache with fixed-size physical pages ($B=16$ tokens) [Kwon et al., 2023].
+2. **FlashDecoding (Split-KV):** Context partitioning along the sequence dimension ($L$) into $K$ parallel splits across independent SMs, followed by an online log-sum-exp reduction kernel [Dao et al., 2023].
 3. **Virtual Memory Host Allocator:** A zero-fragmentation page table manager in Python mirroring OS page tables.
 
 ---
@@ -51,7 +51,7 @@ For query vector $\mathbf{q} \in \mathbb{R}^d$ and scaling factor $\sigma = \fra
 At any step over tokens $t \in [0, L_s - 1]$:
 $$S_t = \sigma (\mathbf{q} \cdot \mathbf{k}_t)$$
 
-Online numerical stabilization maintains running maximum $m^{(t)}$ and running denominator $l^{(t)}$:
+Online numerical stabilization maintains running maximum $m^{(t)}$ and running denominator $l^{(t)}$ [Milakov & Gimelshein, 2018; Dao et al., 2022]:
 $$m^{(t)} = \max\left(m^{(t-1)}, S_t\right)$$
 $$\alpha = \exp\left(m^{(t-1)} - m^{(t)}\right)$$
 $$l^{(t)} = \alpha \cdot l^{(t-1)} + \exp\left(S_t - m^{(t)}\right)$$
@@ -63,7 +63,7 @@ Final normalized output:
 $$\mathbf{O} = \frac{\mathbf{o}^{(L_s - 1)}}{l^{(L_s - 1)}}$$
 
 ### 2.3 Split-KV (FlashDecoding) Two-Stage Reduction
-For context split into $K$ disjoint chunks along the sequence axis, each split $k \in [0, K-1]$ computes local partial results:
+For context split into $K$ disjoint chunks along the sequence axis, each split $k \in [0, K-1]$ computes local partial results [Dao et al., 2023]:
 $$\mathbf{o}_k \in \mathbb{R}^d, \quad m_k \in \mathbb{R}, \quad l_k \in \mathbb{R}$$
 
 Stage 2 reduction merges the $K$ splits:
@@ -183,3 +183,25 @@ extern "C" void launch_paged_attention_v1(
   ```bash
   ncu --set full --target-processes all python paged_bench.py
   ```
+
+---
+
+## 8. Authoritative References & Citations
+
+1. **PagedAttention & vLLM:**
+   - Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Haotong Zhang, and Ion Stoica. 2023. *Efficient Memory Management for Large Language Model Serving with PagedAttention*. In Proceedings of the 29th ACM Symposium on Operating Systems Principles (SOSP '23). arXiv:2309.06180 [cs.OS]. [https://arxiv.org/abs/2309.06180](https://arxiv.org/abs/2309.06180)
+   - Official Repository: [vLLM Project](https://github.com/vllm-project/vllm)
+
+2. **FlashAttention & FlashAttention-2:**
+   - Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. 2022. *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*. Advances in Neural Information Processing Systems (NeurIPS 2022). arXiv:2205.14135 [cs.LG]. [https://arxiv.org/abs/2205.14135](https://arxiv.org/abs/2205.14135)
+   - Tri Dao. 2023. *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning*. International Conference on Learning Representations (ICLR 2024). arXiv:2307.08691 [cs.LG]. [https://arxiv.org/abs/2307.08691](https://arxiv.org/abs/2307.08691)
+
+3. **Flash-Decoding for Long-Context Serving:**
+   - Tri Dao, Daniel Haziza, Francisco Massa, and Grigory Sizov. 2023. *Flash-Decoding for Long-Context Inference*. Stanford CRFM Blog. [https://crfm.stanford.edu/2023/10/12/flashdecoding.html](https://crfm.stanford.edu/2023/10/12/flashdecoding.html)
+
+4. **Online Softmax Algorithms:**
+   - Maxim Milakov and Natalia Gimelshein. 2018. *Online normalizer calculation for softmax*. arXiv:1805.02867 [cs.DS]. [https://arxiv.org/abs/1805.02867](https://arxiv.org/abs/1805.02867)
+
+5. **NVIDIA Hardware & CUDA Architecture:**
+   - NVIDIA Corporation. 2024. *CUDA C++ Programming Guide (Release 12.x)*. Sections: "Warp Shuffle Functions", "Vectorized Memory Accesses", "Ampere sm_80 Architecture Tuning". [https://docs.nvidia.com/cuda/cuda-c-programming-guide/](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
+   - NVIDIA Corporation. 2020. *NVIDIA A100 Tensor Core GPU Architecture Whitepaper*. [https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf](https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf)

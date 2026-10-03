@@ -24,7 +24,7 @@
 \maketitle
 
 \begin{abstract}
-This technical report details the mathematical formulation, memory layout, and parallel reduction schemes for PagedAttention and FlashDecoding (Split-KV) in autoregressive Large Language Model (LLM) inference. We formalize the non-contiguous virtual-to-physical memory translation of Key-Value (KV) cache tensors and derive numerically stable online softmax formulations for both single-pass and multi-split parallel reductions on NVIDIA GPUs.
+This technical report details the mathematical formulation, memory layout, and parallel reduction schemes for PagedAttention \cite{kwon2023pagedattention} and FlashDecoding (Split-KV) \cite{dao2023flashdecoding} in autoregressive Large Language Model (LLM) inference. We formalize the non-contiguous virtual-to-physical memory translation of Key-Value (KV) cache tensors and derive numerically stable online softmax formulations \cite{milakov2018online, dao2022flashattention} for both single-pass and multi-split parallel reductions on NVIDIA GPUs.
 \end{abstract}
 
 \section{Introduction and Problem Formulation}
@@ -40,8 +40,8 @@ In standard implementations, KV caches are allocated contiguously in High-Bandwi
 \end{equation}
 This leads to two critical inefficiencies:
 \begin{enumerate}
-    \item \textbf{Memory Fragmentation:} Up to $60\% - 80\%$ of GPU memory is stranded due to conservative pre-allocation for $L_{\max}$ and unpredictable request termination.
-    \item \textbf{Decode Underutilization:} For a single token ($M=1$), an attention head is mapped to a single thread block. When $L$ is large, Streaming Multiprocessors (SMs) suffer from low occupancy and DRAM latency bottlenecks.
+    \item \textbf{Memory Fragmentation:} Up to $60\% - 80\%$ of GPU memory is stranded due to conservative pre-allocation for $L_{\max}$ and unpredictable request termination \cite{kwon2023pagedattention}.
+    \item \textbf{Decode Underutilization:} For a single token ($M=1$), an attention head is mapped to a single thread block. When $L$ is large, Streaming Multiprocessors (SMs) suffer from low occupancy and DRAM latency bottlenecks \cite{dao2023flashdecoding}.
 \end{enumerate}
 
 \section{Paged Memory Mapping}
@@ -87,7 +87,7 @@ Direct evaluation requires three passes over memory: (1) compute all $S_t$ and w
 
 \subsection{Online Recurrence Formulation}
 
-To execute in a single memory pass within fast on-chip SRAM (Shared Memory and Registers), we maintain running state $(m^{(t)}, l^{(t)}, \mathbf{o}^{(t)})$:
+To execute in a single memory pass within fast on-chip SRAM (Shared Memory and Registers), we maintain running state $(m^{(t)}, l^{(t)}, \mathbf{o}^{(t)})$ following the online normalizer principle \cite{milakov2018online, dao2022flashattention, dao2023flashattention2}:
 \begin{align}
 m^{(t)} &= \max\left( m^{(t-1)}, S_t \right) \\
 \alpha_t &= \exp\left( m^{(t-1)} - m^{(t)} \right) \\
@@ -153,7 +153,46 @@ The final output is computed by normalized convex combination:
     \begin{equation}
     \text{SRAM} = d \times \text{sizeof}(\text{half}) + B \times \text{sizeof}(\text{float}) + \mathcal{O}(1) \le 4\text{ KB}
     \end{equation}
-    permitting high occupancy on sm\_80 and sm\_89 architectures.
+    permitting high occupancy on sm\_80 and sm\_89 architectures \cite{nvidia2024cuda}.
 \end{enumerate}
+
+\begin{thebibliography}{9}
+
+\bibitem{kwon2023pagedattention}
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody~Hao Yu, Joseph~E. Gonzalez, Haotong Zhang, and Ion Stoica.
+\newblock Efficient memory management for large language model serving with {PagedAttention}.
+\newblock In {\em Proceedings of the 29th ACM Symposium on Operating Systems Principles (SOSP '23)}, pages 611--626, 2023.
+\newblock arXiv:2309.06180.
+
+\bibitem{dao2022flashattention}
+Tri Dao, Daniel~Y. Fu, Stefano Ermon, Atri Rudra, and Christopher R{\'e}.
+\newblock {FlashAttention}: Fast and memory-efficient exact attention with {IO}-awareness.
+\newblock In {\em Advances in Neural Information Processing Systems (NeurIPS 2022)}, volume~35, pages 16344--16359, 2022.
+\newblock arXiv:2205.14135.
+
+\bibitem{dao2023flashattention2}
+Tri Dao.
+\newblock {FlashAttention-2}: Faster attention with better parallelism and work partitioning.
+\newblock In {\em International Conference on Learning Representations (ICLR 2024)}, 2024.
+\newblock arXiv:2307.08691.
+
+\bibitem{dao2023flashdecoding}
+Tri Dao, Daniel Haziza, Francisco Massa, and Grigory Sizov.
+\newblock Flash-decoding for long-context inference.
+\newblock {\em Stanford CRFM Blog}, 2023.
+\newblock \url{https://crfm.stanford.edu/2023/10/12/flashdecoding.html}.
+
+\bibitem{milakov2018online}
+Maxim Milakov and Natalia Gimelshein.
+\newblock Online normalizer calculation for softmax.
+\newblock {\em arXiv preprint arXiv:1805.02867}, 2018.
+
+\bibitem{nvidia2024cuda}
+NVIDIA Corporation.
+\newblock {\em CUDA C++ Programming Guide (Release 12.x)}.
+\newblock NVIDIA Developer Zone, 2024.
+\newblock \url{https://docs.nvidia.com/cuda/cuda-c-programming-guide/}.
+
+\end{thebibliography}
 
 \end{document}
