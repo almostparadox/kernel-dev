@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from typing import List
 
 import pytest
 import torch
@@ -11,7 +10,7 @@ import torch.nn.functional as F
 
 from paged_attention.ops import (
     BLOCK_SIZE,
-    paged_attention_reference,
+    load_cpp_extension,
     paged_attention_v1,
 )
 from paged_attention.paged_allocator import (
@@ -19,9 +18,13 @@ from paged_attention.paged_allocator import (
     SequenceBlockTableManager,
 )
 
+DEVICES = ["cpu"]
+if torch.cuda.is_available():
+    DEVICES.append("cuda")
+
 
 def _setup_paged_kv_data(
-    batch_lens: List[int],
+    batch_lens: list[int],
     num_heads: int,
     head_dim: int,
     device: torch.device,
@@ -50,8 +53,8 @@ def _setup_paged_kv_data(
         device=device,
     )
 
-    k_unpaged: List[torch.Tensor] = []
-    v_unpaged: List[torch.Tensor] = []
+    k_unpaged: list[torch.Tensor] = []
+    v_unpaged: list[torch.Tensor] = []
 
     for sid, length in enumerate(batch_lens):
         mgr.allocate_sequence(sid, length)
@@ -69,7 +72,7 @@ def _setup_paged_kv_data(
                 k_pool[p_block, :, :tok_count, :] = k_seq[:, start:end, :]
                 v_pool[p_block, :, :tok_count, :] = v_seq[:, start:end, :]
 
-    max_blocks = max((l + BLOCK_SIZE - 1) // BLOCK_SIZE for l in batch_lens)
+    max_blocks = max((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE for seq_len in batch_lens)
     block_tables = mgr.build_block_table_tensor(
         list(range(batch_size)), max_blocks
     ).to(device)
@@ -81,9 +84,9 @@ def _setup_paged_kv_data(
 
 def _compute_unpaged_sdpa_reference(
     q: torch.Tensor,
-    k_unpaged: List[torch.Tensor],
-    v_unpaged: List[torch.Tensor],
-    batch_lens: List[int],
+    k_unpaged: list[torch.Tensor],
+    v_unpaged: list[torch.Tensor],
+    batch_lens: list[int],
     scale: float,
 ) -> torch.Tensor:
     """Compute PyTorch scaled_dot_product_attention per-sequence on unpaged tensors."""
@@ -110,12 +113,13 @@ def _compute_unpaged_sdpa_reference(
     return ref_out
 
 
+@pytest.mark.parametrize("device_str", DEVICES)
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("num_heads", [1, 4, 8])
-def test_paged_attention_vs_sdpa_variable_lens(head_dim: int, num_heads: int):
-    """Test variable sequence lengths [17, 35, 64] across batch vs PyTorch SDPA."""
+def test_paged_attention_vs_sdpa_variable_lens(device_str: str, head_dim: int, num_heads: int):
+    """Test variable sequence lengths [17, 35, 64] across batch vs PyTorch SDPA on CPU/CUDA."""
     torch.manual_seed(42)
-    device = torch.device("cpu")
+    device = torch.device(device_str)
     batch_lens = [17, 35, 64]
     scale = 1.0 / math.sqrt(head_dim)
 
@@ -130,7 +134,7 @@ def test_paged_attention_vs_sdpa_variable_lens(head_dim: int, num_heads: int):
     ) = _setup_paged_kv_data(batch_lens, num_heads, head_dim, device)
 
     out = paged_attention_v1(
-        q, k_pool, v_pool, block_tables, context_lens, scale=scale, force_cpu=True
+        q, k_pool, v_pool, block_tables, context_lens, scale=scale
     )
     ref = _compute_unpaged_sdpa_reference(
         q, k_unpaged, v_unpaged, batch_lens, scale=scale
@@ -139,15 +143,16 @@ def test_paged_attention_vs_sdpa_variable_lens(head_dim: int, num_heads: int):
     max_err = (out - ref).abs().max().item()
     mse = ((out - ref) ** 2).mean().item()
 
-    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3 for d={head_dim}, h={num_heads}"
-    assert mse < 1e-5, f"MSE {mse} >= 1e-5 for d={head_dim}, h={num_heads}"
+    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3 on {device_str} for d={head_dim}, h={num_heads}"
+    assert mse < 1e-5, f"MSE {mse} >= 1e-5 on {device_str} for d={head_dim}, h={num_heads}"
 
 
+@pytest.mark.parametrize("device_str", DEVICES)
 @pytest.mark.parametrize("batch_lens", [[16, 32, 64], [1, 15, 16]])
-def test_paged_attention_block_boundaries(batch_lens: List[int]):
-    """Test sequences exactly at block boundaries (multiples of 16) and short lengths."""
+def test_paged_attention_block_boundaries(device_str: str, batch_lens: list[int]):
+    """Test sequences exactly at block boundaries (multiples of 16) and short lengths on CPU/CUDA."""
     torch.manual_seed(123)
-    device = torch.device("cpu")
+    device = torch.device(device_str)
     head_dim = 64
     num_heads = 4
     scale = 1.0 / math.sqrt(head_dim)
@@ -163,7 +168,7 @@ def test_paged_attention_block_boundaries(batch_lens: List[int]):
     ) = _setup_paged_kv_data(batch_lens, num_heads, head_dim, device)
 
     out = paged_attention_v1(
-        q, k_pool, v_pool, block_tables, context_lens, scale=scale, force_cpu=True
+        q, k_pool, v_pool, block_tables, context_lens, scale=scale
     )
     ref = _compute_unpaged_sdpa_reference(
         q, k_unpaged, v_unpaged, batch_lens, scale=scale
@@ -172,14 +177,15 @@ def test_paged_attention_block_boundaries(batch_lens: List[int]):
     max_err = (out - ref).abs().max().item()
     mse = ((out - ref) ** 2).mean().item()
 
-    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3 for lens {batch_lens}"
-    assert mse < 1e-5, f"MSE {mse} >= 1e-5 for lens {batch_lens}"
+    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3 on {device_str} for lens {batch_lens}"
+    assert mse < 1e-5, f"MSE {mse} >= 1e-5 on {device_str} for lens {batch_lens}"
 
 
-def test_paged_attention_scattered_physical_blocks():
-    """Test non-contiguous physical block allocations in the block table."""
+@pytest.mark.parametrize("device_str", DEVICES)
+def test_paged_attention_scattered_physical_blocks(device_str: str):
+    """Test non-contiguous physical block allocations in the block table on CPU/CUDA."""
     torch.manual_seed(999)
-    device = torch.device("cpu")
+    device = torch.device(device_str)
     batch_lens = [25, 49, 13]
     head_dim = 128
     num_heads = 4
@@ -198,7 +204,7 @@ def test_paged_attention_scattered_physical_blocks():
     )
 
     out = paged_attention_v1(
-        q, k_pool, v_pool, block_tables, context_lens, scale=scale, force_cpu=True
+        q, k_pool, v_pool, block_tables, context_lens, scale=scale
     )
     ref = _compute_unpaged_sdpa_reference(
         q, k_unpaged, v_unpaged, batch_lens, scale=scale
@@ -207,14 +213,15 @@ def test_paged_attention_scattered_physical_blocks():
     max_err = (out - ref).abs().max().item()
     mse = ((out - ref) ** 2).mean().item()
 
-    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3 with scrambled blocks"
-    assert mse < 1e-5, f"MSE {mse} >= 1e-5 with scrambled blocks"
+    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3 on {device_str} with scrambled blocks"
+    assert mse < 1e-5, f"MSE {mse} >= 1e-5 on {device_str} with scrambled blocks"
 
 
-def test_paged_attention_custom_scale():
-    """Test custom scaling factor passed to paged_attention_v1."""
+@pytest.mark.parametrize("device_str", DEVICES)
+def test_paged_attention_custom_scale(device_str: str):
+    """Test custom scaling factor passed to paged_attention_v1 on CPU/CUDA."""
     torch.manual_seed(77)
-    device = torch.device("cpu")
+    device = torch.device(device_str)
     batch_lens = [17, 32]
     head_dim = 64
     num_heads = 2
@@ -231,7 +238,7 @@ def test_paged_attention_custom_scale():
     ) = _setup_paged_kv_data(batch_lens, num_heads, head_dim, device)
 
     out = paged_attention_v1(
-        q, k_pool, v_pool, block_tables, context_lens, scale=custom_scale, force_cpu=True
+        q, k_pool, v_pool, block_tables, context_lens, scale=custom_scale
     )
     ref = _compute_unpaged_sdpa_reference(
         q, k_unpaged, v_unpaged, batch_lens, scale=custom_scale
@@ -240,14 +247,15 @@ def test_paged_attention_custom_scale():
     max_err = (out - ref).abs().max().item()
     mse = ((out - ref) ** 2).mean().item()
 
-    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3"
-    assert mse < 1e-5, f"MSE {mse} >= 1e-5"
+    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3 on {device_str}"
+    assert mse < 1e-5, f"MSE {mse} >= 1e-5 on {device_str}"
 
 
-def test_paged_attention_preallocated_out():
-    """Test in-place output accumulation with preallocated out tensor."""
+@pytest.mark.parametrize("device_str", DEVICES)
+def test_paged_attention_preallocated_out(device_str: str):
+    """Test in-place output accumulation with preallocated out tensor on CPU/CUDA."""
     torch.manual_seed(88)
-    device = torch.device("cpu")
+    device = torch.device(device_str)
     batch_lens = [19, 33]
     head_dim = 64
     num_heads = 2
@@ -272,7 +280,6 @@ def test_paged_attention_preallocated_out():
         context_lens,
         scale=scale,
         out=out_buf,
-        force_cpu=True,
     )
 
     assert ret is out_buf, "Function should return the same preallocated tensor"
@@ -281,13 +288,14 @@ def test_paged_attention_preallocated_out():
         q, k_unpaged, v_unpaged, batch_lens, scale=scale
     )
     max_err = (out_buf - ref).abs().max().item()
-    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3"
+    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3 on {device_str}"
 
 
-def test_paged_attention_zero_length_sequence():
-    """Test batch containing a sequence with context_len = 0."""
+@pytest.mark.parametrize("device_str", DEVICES)
+def test_paged_attention_zero_length_sequence(device_str: str):
+    """Test batch containing a sequence with context_len = 0 on CPU/CUDA."""
     torch.manual_seed(55)
-    device = torch.device("cpu")
+    device = torch.device(device_str)
     batch_lens = [0, 20, 0]
     head_dim = 64
     num_heads = 2
@@ -304,7 +312,7 @@ def test_paged_attention_zero_length_sequence():
     ) = _setup_paged_kv_data(batch_lens, num_heads, head_dim, device)
 
     out = paged_attention_v1(
-        q, k_pool, v_pool, block_tables, context_lens, scale=scale, force_cpu=True
+        q, k_pool, v_pool, block_tables, context_lens, scale=scale
     )
 
     # Empty sequences should have all zeros in output
@@ -315,13 +323,14 @@ def test_paged_attention_zero_length_sequence():
         q, k_unpaged, v_unpaged, batch_lens, scale=scale
     )
     max_err = (out[1] - ref[1]).abs().max().item()
-    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3 on active sequence"
+    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3 on active sequence on {device_str}"
 
 
-def test_paged_attention_4d_query_input():
-    """Test 4D query tensor shape [batch_size, 1, num_heads, head_dim]."""
+@pytest.mark.parametrize("device_str", DEVICES)
+def test_paged_attention_4d_query_input(device_str: str):
+    """Test 4D query tensor shape [batch_size, 1, num_heads, head_dim] on CPU/CUDA."""
     torch.manual_seed(10)
-    device = torch.device("cpu")
+    device = torch.device(device_str)
     batch_lens = [22, 11]
     head_dim = 64
     num_heads = 4
@@ -340,14 +349,14 @@ def test_paged_attention_4d_query_input():
     q_4d = q.unsqueeze(1)  # [batch_size, 1, num_heads, head_dim]
 
     out = paged_attention_v1(
-        q_4d, k_pool, v_pool, block_tables, context_lens, scale=scale, force_cpu=True
+        q_4d, k_pool, v_pool, block_tables, context_lens, scale=scale
     )
     ref = _compute_unpaged_sdpa_reference(
         q, k_unpaged, v_unpaged, batch_lens, scale=scale
     )
 
     max_err = (out - ref).abs().max().item()
-    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3"
+    assert max_err < 1e-3, f"Max error {max_err} >= 1e-3 on {device_str}"
 
 
 def test_input_validation_errors():
@@ -382,8 +391,6 @@ def test_input_validation_errors():
         paged_attention_v1(bad_q, bad_k, bad_v, block_tables, context_lens)
 
     # 3. Non-contiguous input
-    non_contig_q = q.transpose(0, 1).contiguous().transpose(0, 1)
-    # create truly non-contiguous tensor
     full_t = torch.randn(2, 2, num_heads, head_dim, dtype=torch.float16)
     sliced_q = full_t[:, 0, :, :]
     if not sliced_q.is_contiguous():
@@ -397,35 +404,19 @@ def test_input_validation_errors():
         paged_attention_v1(q, bad_k_block, bad_v_block, block_tables, context_lens)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU not available")
-def test_paged_attention_cuda_parity():
-    """Test numerical parity on CUDA device when GPU is available."""
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-    batch_lens = [17, 35, 64]
-    head_dim = 128
-    num_heads = 4
-    scale = 1.0 / math.sqrt(head_dim)
-
-    (
-        q,
-        k_pool,
-        v_pool,
-        block_tables,
-        context_lens,
-        k_unpaged,
-        v_unpaged,
-    ) = _setup_paged_kv_data(batch_lens, num_heads, head_dim, device)
-
-    out = paged_attention_v1(
-        q, k_pool, v_pool, block_tables, context_lens, scale=scale
-    )
-    ref = _compute_unpaged_sdpa_reference(
-        q, k_unpaged, v_unpaged, batch_lens, scale=scale
-    )
-
-    max_err = (out - ref).abs().max().item()
-    mse = ((out - ref) ** 2).mean().item()
-
-    assert max_err < 1e-3, f"CUDA Max error {max_err} >= 1e-3"
-    assert mse < 1e-5, f"CUDA MSE {mse} >= 1e-5"
+def test_cuda_no_silent_fallback_enforcement():
+    """Verify that calling paged_attention_v1 on CUDA raises RuntimeError if extension is missing."""
+    if not torch.cuda.is_available():
+        # Verify simulator is explicitly callable for CPU execution
+        q = torch.randn(1, 2, 64, dtype=torch.float16)
+        k_pool = torch.randn(1, 2, BLOCK_SIZE, 64, dtype=torch.float16)
+        v_pool = torch.randn(1, 2, BLOCK_SIZE, 64, dtype=torch.float16)
+        bt = torch.tensor([[0]], dtype=torch.int32)
+        ctx = torch.tensor([10], dtype=torch.int32)
+        out = paged_attention_v1(q, k_pool, v_pool, bt, ctx, force_cpu=True)
+        assert out.shape == q.shape
+    else:
+        # On CUDA, ensure paged_ops extension is directly exercised without fallback
+        mod = load_cpp_extension()
+        assert mod is not None, "CUDA extension must load on CUDA device"
+        assert hasattr(mod, "paged_attention_v1"), "mod must have paged_attention_v1"

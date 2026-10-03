@@ -168,8 +168,8 @@ torch::Tensor paged_attention_v1(
     const torch::Tensor& v_pool,
     const torch::Tensor& block_tables,
     const torch::Tensor& context_lens,
-    c10::optional<torch::Tensor> out_opt,
-    c10::optional<double> scale_opt
+    float scale = 0.0f,
+    c10::optional<torch::Tensor> out_opt = c10::nullopt
 ) {
     check_paged_attention_v1_inputs(q, k_pool, v_pool, block_tables, context_lens, out_opt);
 
@@ -187,8 +187,8 @@ torch::Tensor paged_attention_v1(
         out = torch::empty({batch_size, num_heads, head_dim}, q_sq.options());
     }
 
-    const float scale = scale_opt.has_value()
-        ? static_cast<float>(scale_opt.value())
+    const float final_scale = (scale > 0.0f)
+        ? scale
         : (1.0f / std::sqrt(static_cast<float>(head_dim)));
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream(q.get_device()).stream();
@@ -204,7 +204,7 @@ torch::Tensor paged_attention_v1(
         batch_size,
         num_heads,
         head_dim,
-        scale,
+        final_scale,
         stream
     );
 
@@ -225,8 +225,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("v_pool"),
         py::arg("block_tables"),
         py::arg("context_lens"),
-        py::arg("out") = py::none(),
-        py::arg("scale") = py::none()
+        py::arg("scale") = 0.0f,
+        py::arg("out") = py::none()
     );
     m.def(
         "paged_attention_v1_out",
@@ -236,8 +236,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            const torch::Tensor& v_pool,
            const torch::Tensor& block_tables,
            const torch::Tensor& context_lens,
-           c10::optional<double> scale) {
-            return paged_attention_v1(q, k_pool, v_pool, block_tables, context_lens, out, scale);
+           float scale) {
+            return paged_attention_v1(q, k_pool, v_pool, block_tables, context_lens, scale, out);
         },
         "PagedAttention V1 single-pass decode kernel (out passed first)",
         py::arg("out"),
@@ -246,7 +246,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("v_pool"),
         py::arg("block_tables"),
         py::arg("context_lens"),
-        py::arg("scale") = py::none()
+        py::arg("scale") = 0.0f
     );
 }
 

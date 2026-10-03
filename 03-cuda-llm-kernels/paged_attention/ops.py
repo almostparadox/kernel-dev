@@ -5,7 +5,6 @@ from __future__ import annotations
 import ctypes
 import math
 from pathlib import Path
-from typing import Optional
 
 import torch
 
@@ -15,7 +14,7 @@ _CPP_MODULE = None
 _CTYPES_LAUNCHER = None
 
 
-def load_cpp_extension(build_directory: Optional[str] = None, verbose: bool = False):
+def load_cpp_extension(build_directory: str | None = None, verbose: bool = False):
     """Load or JIT-compile the PyTorch C++ extension for PagedAttention."""
     global _CPP_MODULE
     if _CPP_MODULE is not None:
@@ -68,7 +67,7 @@ def load_cpp_extension(build_directory: Optional[str] = None, verbose: bool = Fa
         return None
 
 
-def load_ctypes_lib(path: Optional[str] = None) -> Optional[ctypes.CDLL]:
+def load_ctypes_lib(path: str | None = None) -> ctypes.CDLL | None:
     """Load precompiled PagedAttention shared library via ctypes."""
     global _CTYPES_LAUNCHER
     if _CTYPES_LAUNCHER is not None and path is None:
@@ -148,7 +147,7 @@ def _validate_inputs(
     v_pool: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> tuple[int, int, int]:
     """Validate shapes, dtypes, contiguous layout, and device placement."""
     if not isinstance(q, torch.Tensor):
@@ -251,8 +250,8 @@ def paged_attention_reference(
     v_pool: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
-    scale: Optional[float] = None,
-    out: Optional[torch.Tensor] = None,
+    scale: float = 0.0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Golden reference simulator for PagedAttention single-pass decode.
 
@@ -264,7 +263,7 @@ def paged_attention_reference(
         q, k_pool, v_pool, block_tables, context_lens, out
     )
 
-    if scale is None:
+    if scale <= 0.0:
         scale = 1.0 / math.sqrt(head_dim)
 
     q_sq = q.squeeze(1) if q.dim() == 4 else q
@@ -314,24 +313,27 @@ def paged_attention_v1(
     v_pool: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
-    scale: Optional[float] = None,
-    out: Optional[torch.Tensor] = None,
+    scale: float = 0.0,
+    out: torch.Tensor | None = None,
     force_cpu: bool = False,
 ) -> torch.Tensor:
     """Execute PagedAttention V1 decode attention.
 
     Dispatches to compiled CUDA extension / ctypes shared library if on CUDA,
     or falls back to the golden reference simulator if on CPU or forced.
+    Raises RuntimeError if CUDA tensor is passed and CUDA extension is not loaded.
     """
     batch_size, num_heads, head_dim = _validate_inputs(
         q, k_pool, v_pool, block_tables, context_lens, out
     )
 
-    if scale is None:
+    if scale <= 0.0:
         scale = 1.0 / math.sqrt(head_dim)
 
+    is_cuda = q.is_cuda or q.device.type == "cuda"
+
     # 1. CPU execution or explicit force_cpu
-    if force_cpu or not q.is_cuda:
+    if force_cpu or not is_cuda:
         return paged_attention_reference(
             q, k_pool, v_pool, block_tables, context_lens, scale=scale, out=out
         )
@@ -340,11 +342,11 @@ def paged_attention_v1(
     mod = load_cpp_extension()
     if mod is not None and hasattr(mod, "paged_attention_v1"):
         return mod.paged_attention_v1(
-            q, k_pool, v_pool, block_tables, context_lens, out, scale
+            q, k_pool, v_pool, block_tables, context_lens, scale, out
         )
 
     # 3. CUDA execution: try ctypes shared library
-    clib = load_ctypes_lib()
+    _ = load_ctypes_lib()
     global _CTYPES_LAUNCHER
     if _CTYPES_LAUNCHER is not None:
         q_sq = q.squeeze(1) if q.dim() == 4 else q
@@ -354,7 +356,7 @@ def paged_attention_v1(
                 dtype=torch.float16,
                 device=q.device,
             )
-        stream = torch.cuda.current_stream().cuda_stream
+        stream = torch.cuda.current_stream(q.device).cuda_stream
         max_blocks_per_seq = block_tables.shape[1]
 
         _CTYPES_LAUNCHER(
@@ -373,8 +375,7 @@ def paged_attention_v1(
         )
         return out
 
-    # 4. If on CUDA but no compiled kernel found, fallback to reference on GPU
-    # or raise informative error
-    return paged_attention_reference(
-        q, k_pool, v_pool, block_tables, context_lens, scale=scale, out=out
+    # 4. Strict CUDA enforcement: do NOT silently fallback to CPU reference simulator
+    raise RuntimeError(
+        "CUDA PagedAttention extension not available. Compile via scripts/compile_paged_ops.sh or load valid paged_attention.so"
     )
